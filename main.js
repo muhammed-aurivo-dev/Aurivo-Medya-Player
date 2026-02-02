@@ -1,8 +1,62 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, nativeImage, Tray, Menu, shell, session } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+
+// MPRIS (Linux Media Player Remote Interfacing Specification)
+let Player = null;
+try {
+    Player = require('mpris-service');
+} catch (e) {
+    console.log('mpris-service yüklenemedi (sadece Linux):', e.message);
+}
+
+// stdout/stderr pipe kapandığında (örn. `| head`) Node `EPIPE` fırlatabilir.
+// Uygulamanın bu yüzden çökmesini engelle.
+for (const stream of [process.stdout, process.stderr]) {
+    if (!stream || typeof stream.on !== 'function') continue;
+    stream.on('error', (err) => {
+        if (err && err.code === 'EPIPE') return;
+    });
+}
+
+// Global uncaught exception handler - MPRIS/dbus hataları için
+process.on('uncaughtException', (error) => {
+    // EPIPE hataları - dbus bağlantısı koptuğunda oluşur
+    if (error.code === 'EPIPE' ||
+        (error.message && error.message.includes('EPIPE')) ||
+        (error.message && error.message.includes('stream is closed')) ||
+        (error.message && error.message.includes('Cannot send message'))) {
+        // Sessizce yoksay - bu normal bir durum
+        return;
+    }
+
+    // Diğer hatalar için log yaz ama dialog gösterme
+    console.error('Uncaught Exception:', error);
+});
+
+function safeStdoutLine(line) {
+    try {
+        process.stdout.write(String(line) + '\n');
+    } catch (err) {
+        if (err && err.code === 'EPIPE') return;
+    }
+}
+
+// GNOME/Wayland üst bar & dock ikon eşleştirmesi için (desktop entry ile match)
+const LINUX_WM_CLASS = 'aurivo-media-player';
+if (process.platform === 'linux') {
+    app.commandLine.appendSwitch('class', LINUX_WM_CLASS);
+}
+
+// FIX: Disable Chromium's MediaSessionService to prevent duplicate players for WebViews
+app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling,MediaSessionService');
+
+// Windows 10/11: taskbar/dock ikon eşleştirmesi ve gruplama
+if (process.platform === 'win32') {
+    app.setAppUserModelId('com.aurivo.mediaplayer');
+}
 // ============================================
 // WAYLAND / X11 OTOMATIK ALGILAMA
 // ============================================
@@ -82,12 +136,12 @@ function detectDisplayServer() {
     if (app && app.commandLine) {
         app.commandLine.appendSwitch('enable-gpu-rasterization');
         app.commandLine.appendSwitch('enable-zero-copy');
-        
+
         // Font rendering iyileştirmeleri - Wayland/X11 uyumluluğu
         app.commandLine.appendSwitch('disable-font-subpixel-positioning');
         app.commandLine.appendSwitch('enable-font-antialiasing');
         app.commandLine.appendSwitch('force-device-scale-factor', '1');
-        
+
         // Context menu düzeltmeleri
         app.commandLine.appendSwitch('disable-gpu-sandbox');
     }
@@ -148,9 +202,128 @@ try {
 }
 
 let mainWindow;
+let tray = null;
+let mprisPlayer = null;
+
+// Download state (Aurivo-Dawlod / yt-dlp)
+let downloadSeq = 0;
+const activeDownloads = new Map(); // id -> { proc, killTimer }
+
+function getResourcePath(relPath) {
+    // Dev: direct from repo
+    // Prod: app.asar/index -> resources/
+    if (app.isPackaged) {
+        return path.join(process.resourcesPath, relPath);
+    }
+    return path.join(__dirname, relPath);
+}
+
+function getDownloaderCliPath() {
+    return getResourcePath(path.join('Aurivo-Dawlod', 'aurivo_download_cli.py'));
+}
+
+function getPythonCandidates() {
+    const out = [];
+
+    const envPython = process.env.AURIVO_PYTHON;
+    if (envPython) out.push(envPython);
+
+    // Dev: repo-local venv first
+    if (!app.isPackaged) {
+        if (process.platform === 'win32') {
+            out.push(path.join(__dirname, '.venv', 'Scripts', 'python.exe'));
+        } else {
+            out.push(path.join(__dirname, '.venv', 'bin', 'python'));
+        }
+    }
+
+    if (process.platform !== 'win32') out.push('python3');
+    out.push('python');
+
+    return [...new Set(out)].filter(Boolean);
+}
+
+function spawnPythonWithFallback(args, spawnOpts) {
+    const candidates = getPythonCandidates();
+    let idx = 0;
+
+    return new Promise((resolve, reject) => {
+        const tryNext = (lastErr) => {
+            if (idx >= candidates.length) {
+                reject(lastErr || new Error('Python bulunamadı (AURIVO_PYTHON ayarlayabilir veya python3/python kurabilirsiniz).'));
+                return;
+            }
+
+            const py = candidates[idx++];
+            let child = null;
+            try {
+                child = spawn(py, args, {
+                    ...spawnOpts,
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+            } catch (e) {
+                tryNext(e);
+                return;
+            }
+
+            child.once('error', (err) => {
+                if (err && err.code === 'ENOENT') {
+                    tryNext(err);
+                    return;
+                }
+                reject(err);
+            });
+
+            resolve(child);
+        };
+
+        tryNext(null);
+    });
+}
+
+function getAppIconPath() {
+    if (process.platform === 'win32') {
+        return getResourcePath(path.join('icons', 'aurivo.ico'));
+    }
+    return getResourcePath(path.join('icons', 'aurivo_256.png'));
+}
+
+function getAppIconImage() {
+    const iconPath = getAppIconPath();
+    const img = nativeImage.createFromPath(iconPath);
+    if (!img || img.isEmpty()) {
+        return nativeImage.createFromPath(path.join(__dirname, 'icons', 'aurivo_256.png'));
+    }
+    return img;
+}
 
 function getSettingsPath() {
     return path.join(app.getPath('userData'), 'settings.json');
+}
+
+async function writeJsonFileAtomic(filePath, obj) {
+    const dir = path.dirname(filePath);
+    try {
+        await fs.promises.mkdir(dir, { recursive: true });
+    } catch {
+        // ignore
+    }
+
+    const tmpPath = `${filePath}.tmp`;
+    const json = JSON.stringify(obj ?? {}, null, 2);
+    await fs.promises.writeFile(tmpPath, json, 'utf8');
+
+    try {
+        await fs.promises.rename(tmpPath, filePath);
+    } catch (e) {
+        // Windows'ta hedef dosya varsa rename bazen hata verebilir.
+        if (e && (e.code === 'EEXIST' || e.code === 'EPERM' || e.code === 'EACCES')) {
+            await fs.promises.unlink(filePath).catch(() => { /* ignore */ });
+            await fs.promises.rename(tmpPath, filePath);
+            return;
+        }
+        throw e;
+    }
 }
 
 function normalizeEq32BandsForEngine(bands) {
@@ -202,6 +375,30 @@ async function applyPersistedEq32SfxFromSettings() {
     }
 }
 
+async function updateEq32SettingsInFile(patch) {
+    try {
+        let current = null;
+        try {
+            const data = await fs.promises.readFile(getSettingsPath(), 'utf8');
+            current = JSON.parse(data);
+        } catch {
+            current = {};
+        }
+
+        const next = { ...(current || {}) };
+        next.sfx = { ...(next.sfx || {}) };
+        next.sfx.eq32 = { ...(next.sfx.eq32 || {}) };
+
+        Object.assign(next.sfx.eq32, patch || {});
+
+        await writeJsonFileAtomic(getSettingsPath(), next);
+        return next;
+    } catch (e) {
+        console.error('[SFX] EQ32 settings update error:', e);
+        return null;
+    }
+}
+
 function createWindow() {
     mainWindow = new BrowserWindow({
         width: 1500,
@@ -209,7 +406,7 @@ function createWindow() {
         minWidth: 1200,
         minHeight: 720,
         backgroundColor: '#121212',
-        icon: path.join(__dirname, '../icons/aurivo_256.png'),
+        icon: getAppIconImage(),
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: false,
@@ -223,6 +420,12 @@ function createWindow() {
         show: false
     });
 
+    let hasEverBeenShown = false;
+
+    if (process.platform === 'linux' && typeof mainWindow.setIcon === 'function') {
+        mainWindow.setIcon(getAppIconImage());
+    }
+
     mainWindow.loadFile(path.join(__dirname, 'index.html'));
 
     // İlk açılışta pencereyi zorla görünür yap
@@ -234,13 +437,14 @@ function createWindow() {
     mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
         // sourceId boş olabiliyor
         const src = sourceId ? String(sourceId).split('/').slice(-1)[0] : 'renderer';
-        console.log(`[RENDERER] ${message} (${src}:${line})`);
+        safeStdoutLine(`[RENDERER] ${message} (${src}:${line})`);
     });
 
     // Pencere hazır olduğunda göster (flash önleme)
     mainWindow.once('ready-to-show', () => {
         mainWindow.show();
         mainWindow.focus();
+        hasEverBeenShown = true;
     });
 
     // Wayland/GPU sorunlarında ready-to-show tetiklenmezse fallback
@@ -248,6 +452,7 @@ function createWindow() {
         if (!mainWindow.isVisible()) {
             mainWindow.show();
             mainWindow.focus();
+            hasEverBeenShown = true;
         }
         // Pencereyi öne getir
         mainWindow.setAlwaysOnTop(true);
@@ -261,13 +466,14 @@ function createWindow() {
         if (mainWindow && !mainWindow.isVisible()) {
             mainWindow.show();
             mainWindow.focus();
+            hasEverBeenShown = true;
         }
     }, 2000);
 
     // Eğer pencere hiç görünmezse yazılım render'a otomatik düş
     setTimeout(() => {
         const alreadySoftware = process.env.AURIVO_SOFTWARE_RENDER === '1' || process.env.AURIVO_SOFTWARE_RENDER === 'true';
-        if (mainWindow && !mainWindow.isVisible() && !alreadySoftware) {
+        if (mainWindow && !hasEverBeenShown && !mainWindow.isVisible() && !alreadySoftware) {
             console.warn('[GPU] Window not visible -> fallback to software rendering');
             app.relaunch({
                 env: {
@@ -285,6 +491,15 @@ function createWindow() {
         // mainWindow.webContents.openDevTools();
     }
 
+    // Pencere kapatma davranışı: tray'e minimize et
+    mainWindow.on('close', (event) => {
+        if (!app.isQuitting) {
+            event.preventDefault();
+            mainWindow.hide();
+            return false;
+        }
+    });
+
     mainWindow.on('closed', () => {
         mainWindow = null;
         // Ana pencere kapandığında ses efektleri penceresini de kapat
@@ -292,6 +507,270 @@ function createWindow() {
             soundEffectsWindow.close();
         }
     });
+}
+
+function createTray() {
+    const iconPath = process.platform === 'win32'
+        ? getResourcePath(path.join('icons', 'aurivo_256.png'))
+        : getResourcePath(path.join('icons', 'aurivo_256.png'));
+
+    tray = new Tray(nativeImage.createFromPath(iconPath));
+
+    updateTrayMenu({ isPlaying: false, currentTrack: 'Aurivo Media Player' });
+
+    tray.setToolTip('Aurivo Media Player');
+
+    // Tray ikonuna sol tık: pencereyi göster/gizle
+    tray.on('click', () => {
+        if (mainWindow) {
+            if (mainWindow.isVisible()) {
+                mainWindow.hide();
+            } else {
+                mainWindow.show();
+                mainWindow.focus();
+            }
+        }
+    });
+}
+
+// ============================================
+// MPRIS (Linux Media Player Integration)
+// ============================================
+function createMPRIS() {
+    if (!Player || process.platform !== 'linux') {
+        console.log('MPRIS sadece Linux için destekleniyor');
+        return;
+    }
+
+    try {
+        mprisPlayer = Player({
+            name: 'aurivo',
+            identity: 'Aurivo Media Player',
+            desktopEntry: 'aurivo-media-player', // KDE/GNOME eşleşmesi için gerekli
+            supportedUriSchemes: ['file'],
+            supportedMimeTypes: ['audio/mpeg', 'audio/flac', 'audio/x-wav', 'audio/ogg'],
+            supportedInterfaces: ['player']
+        });
+
+        // Playback yeteneklerini ayarla
+        mprisPlayer.canSeek = true;
+        mprisPlayer.canControl = true;
+        mprisPlayer.canPlay = true;
+        mprisPlayer.canPause = true;
+        mprisPlayer.canGoNext = true;
+        mprisPlayer.canGoPrevious = true;
+
+        // Playback kontrollerini bağla
+        mprisPlayer.on('play', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'play-pause');
+            }
+        });
+
+        mprisPlayer.on('pause', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'play-pause');
+            }
+        });
+
+        mprisPlayer.on('playpause', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'play-pause');
+            }
+        });
+
+        mprisPlayer.on('stop', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'stop');
+            }
+        });
+
+        mprisPlayer.on('next', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'next');
+            }
+        });
+
+        mprisPlayer.on('previous', () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('media-control', 'previous');
+            }
+        });
+
+        mprisPlayer.on('seek', (offset) => {
+            console.log('MPRIS seek event, offset:', offset);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('mpris-seek', offset);
+            }
+        });
+
+        mprisPlayer.on('position', (event) => {
+            console.log('MPRIS position event:', event.position);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('mpris-position', event.position);
+            }
+        });
+
+        // getPosition desteği (MPRIS tarafından çağrılır)
+        mprisPlayer.getPosition = () => {
+            // Çalıyorsa, son güncellemeden bu yana geçen süreyi ekle (Extrapolation)
+            if (mprisPlayer.playbackStatus === Player.PLAYBACK_STATUS_PLAYING && mprisPlayer._lastUpdateHRTime) {
+                const elapsed = process.hrtime(mprisPlayer._lastUpdateHRTime);
+                const elapsedMicros = (elapsed[0] * 1000000) + Math.floor(elapsed[1] / 1000);
+                return (mprisPlayer.position || 0) + elapsedMicros;
+            }
+            return mprisPlayer.position || 0;
+        };
+
+        console.log('✓ MPRIS player başlatıldı');
+    } catch (e) {
+        // MPRIS başlatma hatalarını sessizce yoksay
+        console.log('MPRIS başlatma atlandı:', e.message);
+    }
+}
+
+// MPRIS metadata güncelleme
+function updateMPRISMetadata(metadata) {
+    if (!mprisPlayer) return;
+
+    try {
+        const mprisMetadata = {
+            'mpris:trackid': mprisPlayer.objectPath('track/' + (metadata.trackId || '0')),
+            'mpris:length': Math.floor((metadata.duration || 0) * 1000000), // saniye -> mikrosaniye
+            'mpris:artUrl': metadata.albumArt || '',
+            'xesam:title': metadata.title || 'Bilinmeyen Parça',
+            'xesam:artist': metadata.artist ? [metadata.artist] : ['Bilinmeyen Sanatçı'],
+            'xesam:album': metadata.album || ''
+        };
+
+        mprisPlayer.metadata = mprisMetadata;
+        mprisPlayer.playbackStatus = metadata.isPlaying ? Player.PLAYBACK_STATUS_PLAYING : Player.PLAYBACK_STATUS_PAUSED;
+
+        // Pozisyon bilgisini güncelle (saniye -> mikrosaniye)
+        if (typeof metadata.position === 'number') {
+            mprisPlayer.position = Math.floor(metadata.position * 1000000);
+            mprisPlayer._lastUpdateHRTime = process.hrtime();
+        }
+
+        // Seek yeteneklerini güncelle
+        mprisPlayer.canSeek = true;
+        mprisPlayer.canControl = true;
+
+        console.log('MPRIS metadata güncellendi:', metadata.title, 'duration:', metadata.duration.toFixed(1), 's, position:', metadata.position.toFixed(1), 's');
+    } catch (e) {
+        // D-Bus bağlantı hataları - sessizce yoksay (normal durum)
+        // EPIPE, stream closed gibi hatalar dbus bağlantısı hazır olmadığında oluşur
+        const ignoredErrors = ['EPIPE', 'stream is closed', 'Cannot send message'];
+        const shouldIgnore = ignoredErrors.some(err =>
+            e.code === err || (e.message && e.message.includes(err))
+        );
+
+        if (!shouldIgnore) {
+            console.error('MPRIS metadata güncelleme hatası:', e.message);
+        }
+        // Hata gösterme - bu normal bir durum
+    }
+}
+
+function updateTrayMenu(state) {
+    if (!tray) return;
+
+    const { isPlaying = false, currentTrack = 'Aurivo Media Player', isMuted = false, stopAfterCurrent = false } = state;
+
+    // İkonları yükle
+    const iconPath = (name) => {
+        const p = getResourcePath(path.join('icons', name));
+        return nativeImage.createFromPath(p);
+    };
+
+    const contextMenu = Menu.buildFromTemplate([
+        {
+            label: 'Önceki parça',
+            icon: iconPath('tray-previous.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'previous');
+                }
+            }
+        },
+        {
+            label: isPlaying ? 'Duraklat' : 'Oynat',
+            icon: iconPath(isPlaying ? 'tray-pause.png' : 'tray-play.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'play-pause');
+                }
+            }
+        },
+        {
+            label: 'Durdur',
+            icon: iconPath('tray-stop.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'stop');
+                }
+            }
+        },
+        {
+            label: 'Bu parçadan sonra durdur',
+            type: 'checkbox',
+            checked: stopAfterCurrent,
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'stop-after-current');
+                }
+            }
+        },
+        {
+            label: 'Sonraki parça',
+            icon: iconPath('tray-next.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'next');
+                }
+            }
+        },
+        { type: 'separator' },
+        {
+            label: isMuted ? 'Sesi aç' : 'Sessiz',
+            icon: iconPath(isMuted ? 'tray-volume.png' : 'tray-mute.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'mute-toggle');
+                }
+            }
+        },
+        {
+            label: 'Beğen',
+            icon: iconPath('tray-like.png'),
+            click: () => {
+                if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.send('media-control', 'like');
+                }
+            }
+        },
+        { type: 'separator' },
+        {
+            label: 'Göster',
+            icon: iconPath('tray-show.png'),
+            click: () => {
+                if (mainWindow) {
+                    mainWindow.show();
+                    mainWindow.focus();
+                }
+            }
+        },
+        {
+            label: 'Çık',
+            icon: iconPath('tray-exit.png'),
+            click: () => {
+                app.isQuitting = true;
+                app.quit();
+            }
+        }
+    ]);
+
+    tray.setContextMenu(contextMenu);
 }
 
 // ============================================
@@ -317,7 +796,7 @@ function createSoundEffectsWindow() {
         minWidth: 1000,
         minHeight: 600,
         backgroundColor: '#0a0a0f',
-        icon: path.join(__dirname, 'icons/aurivo_256.png'),
+        icon: getAppIconImage(),
         parent: null, // Bağımsız pencere (ana pencereden ayrı)
         modal: false,
         webPreferences: {
@@ -330,6 +809,10 @@ function createSoundEffectsWindow() {
         title: 'Ses Efektleri — Aurivo Medya Player',
         show: false
     });
+
+    if (process.platform === 'linux' && typeof soundEffectsWindow.setIcon === 'function') {
+        soundEffectsWindow.setIcon(getAppIconImage());
+    }
 
     soundEffectsWindow.loadFile(path.join(__dirname, 'soundEffects.html'));
 
@@ -344,21 +827,37 @@ function createSoundEffectsWindow() {
 }
 
 function createEQPresetsWindow() {
+    console.log('[createEQPresetsWindow] Fonksiyon çağrıldı');
+
     // Pencere zaten açıksa, önne getir
     if (eqPresetsWindow && !eqPresetsWindow.isDestroyed()) {
+        console.log('[createEQPresetsWindow] Pencere zaten açık, focus yapılıyor');
         eqPresetsWindow.focus();
         return;
     }
 
+    // Parent: ses efektleri penceresini bul; yoksa ana pencereyi kullan
+    let parentWindow = null;
+    if (soundEffectsWindow && !soundEffectsWindow.isDestroyed()) {
+        parentWindow = soundEffectsWindow;
+        console.log('[createEQPresetsWindow] Parent: soundEffectsWindow');
+    } else if (mainWindow && !mainWindow.isDestroyed()) {
+        parentWindow = mainWindow;
+        console.log('[createEQPresetsWindow] Parent: mainWindow');
+    } else {
+        console.log('[createEQPresetsWindow] UYARI: Parent pencere bulunamadı!');
+    }
+
+    console.log('[createEQPresetsWindow] BrowserWindow oluşturuluyor...');
     eqPresetsWindow = new BrowserWindow({
         width: 560,
         height: 720,
         minWidth: 520,
         minHeight: 640,
         backgroundColor: '#111115',
-        icon: path.join(__dirname, 'icons/aurivo_256.png'),
-        parent: soundEffectsWindow && !soundEffectsWindow.isDestroyed() ? soundEffectsWindow : (mainWindow || null),
-        modal: true,
+        icon: getAppIconImage(),
+        parent: parentWindow,
+        modal: false,
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             nodeIntegration: false,
@@ -370,10 +869,28 @@ function createEQPresetsWindow() {
         show: false
     });
 
-    eqPresetsWindow.loadFile(path.join(__dirname, 'eqPresets.html'));
+    let hasEverBeenShown = false;
+
+    if (process.platform === 'linux' && typeof eqPresetsWindow.setIcon === 'function') {
+        eqPresetsWindow.setIcon(getAppIconImage());
+    }
+
+    const htmlPath = path.join(__dirname, 'eqPresets.html');
+    console.log('[createEQPresetsWindow] HTML dosyası yükleniyor:', htmlPath);
+
+    eqPresetsWindow.loadFile(htmlPath)
+        .then(() => {
+            console.log('[createEQPresetsWindow] HTML yükleme başarılı, pencere gösteriliyor');
+            if (eqPresetsWindow && !eqPresetsWindow.isDestroyed()) {
+                eqPresetsWindow.show();
+            }
+        })
+        .catch(err => {
+            console.error('[createEQPresetsWindow] loadFile HATA:', err);
+        });
 
     eqPresetsWindow.once('ready-to-show', () => {
-        eqPresetsWindow.show();
+        console.log('[createEQPresetsWindow] ready-to-show event tetiklendi');
     });
 
     eqPresetsWindow.on('closed', () => {
@@ -396,9 +913,16 @@ ipcMain.handle('soundEffects:closeWindow', () => {
 });
 
 // EQ Hazır Ayarlar Penceresini Aç
-ipcMain.handle('eqPresets:openWindow', () => {
-    createEQPresetsWindow();
-    return true;
+ipcMain.handle('eqPresets:openWindow', async () => {
+    try {
+        console.log('[EQ Presets] IPC handler çağrıldı, pencere açılıyor...');
+        createEQPresetsWindow();
+        console.log('[EQ Presets] Pencere oluşturuldu');
+        return true;
+    } catch (err) {
+        console.error('[EQ Presets] Hata:', err);
+        return false;
+    }
 });
 
 ipcMain.handle('eqPresets:closeWindow', () => {
@@ -482,7 +1006,7 @@ function isDevMode() {
 }
 
 function getProjectMPresetsPath() {
-    return path.join(__dirname, 'third_party', 'projectm', 'presets');
+    return getResourcePath(path.join('third_party', 'projectm', 'presets'));
 }
 
 function getVisualizerExecutablePath() {
@@ -490,8 +1014,8 @@ function getVisualizerExecutablePath() {
         ? 'aurivo-projectm-visualizer.exe'
         : 'aurivo-projectm-visualizer';
 
-    // Packaged/runtime default: native-dist (repo içine kopyalanmış binary)
-    const distPath = path.join(__dirname, 'native-dist', exeName);
+    // Packaged/runtime default: resources/native-dist (via extraFiles)
+    const distPath = getResourcePath(path.join('native-dist', exeName));
 
     // Dev convenience: prefer the freshly built CMake output if available.
     // This avoids "derlemede çalışıyor ama uygulamada çalışmıyor" issues caused by forgetting to copy to native-dist.
@@ -499,10 +1023,10 @@ function getVisualizerExecutablePath() {
         ? [
             path.join(__dirname, 'build-visualizer', 'Release', exeName),
             path.join(__dirname, 'build-visualizer', exeName)
-          ]
+        ]
         : [
             path.join(__dirname, 'build-visualizer', exeName)
-          ];
+        ];
 
     if (isDevMode()) {
         for (const p of devCandidates) {
@@ -537,9 +1061,15 @@ function startVisualizer() {
         return false;
     }
 
+    const visualizerIconPath = getResourcePath(path.join('icons', 'aurivo_logo.bmp'));
+
     const env = {
         ...process.env,
         PROJECTM_PRESETS_PATH: presetsPath,
+        AURIVO_VISUALIZER_ICON: visualizerIconPath,
+        // Default main window size (user can resize; next open returns to this default).
+        AURIVO_VIS_MAIN_W: process.env.AURIVO_VIS_MAIN_W || '900',
+        AURIVO_VIS_MAIN_H: process.env.AURIVO_VIS_MAIN_H || '650',
         // SDL2 için gerekli display variables (Wayland öncelikli)
         DISPLAY: process.env.DISPLAY || '',
         WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || '',
@@ -553,20 +1083,21 @@ function startVisualizer() {
     try {
         console.log('[Visualizer] starting:', exePath);
         console.log('[Visualizer] presets:', presetsPath);
+        console.log('[Visualizer] ✓ Input source: Aurivo PCM only (NO mic/capture)');
         console.log('[Visualizer] DISPLAY:', env.DISPLAY);
         console.log('[Visualizer] SDL_VIDEODRIVER:', env.SDL_VIDEODRIVER);
-        
+
         // Debug: strace ile çalıştır
         const useStrace = false; // Set to true for debugging
         const actualExe = useStrace ? 'strace' : exePath;
         const actualArgs = useStrace ? ['-o', '/tmp/visualizer-strace.log', '-ff', exePath, '--presets', presetsPath] : ['--presets', presetsPath];
-        
+
         visualizerProc = spawn(actualExe, actualArgs, {
             env,
             stdio: ['pipe', 'inherit', 'inherit'], // Always inherit stdout/stderr for debugging
             detached: true // Run in separate process group to avoid Electron's GL context conflicts
         });
-        
+
         // Unref so Electron doesn't wait for visualizer
         visualizerProc.unref();
 
@@ -671,19 +1202,25 @@ app.whenReady().then(async () => {
     app.commandLine.appendSwitch('enable-zero-copy');
 
     createWindow();
+    createTray();
+    createMPRIS();
 
     // Kayıtlı EQ32 presetini açılışta uygula
     await applyPersistedEq32SfxFromSettings();
 
     app.on('activate', () => {
-        if (BrowserWindow.getAllWindows().length === 0) {
+        if (mainWindow) {
+            mainWindow.show();
+            mainWindow.focus();
+        } else {
             createWindow();
         }
     });
 });
 
 app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') {
+    // Tray varsa uygulamayı kapatma (arka planda çalışmaya devam et)
+    if (process.platform !== 'darwin' && !tray) {
         app.quit();
     }
 });
@@ -709,10 +1246,13 @@ ipcMain.handle('dialog:openFile', async () => {
     return result.filePaths;
 });
 
-ipcMain.handle('dialog:openFolder', async () => {
+ipcMain.handle('dialog:openFolder', async (_event, opts) => {
+    const title = (opts && typeof opts === 'object' && opts.title) ? String(opts.title) : 'Müzik Klasörü Seç';
+    const defaultPath = (opts && typeof opts === 'object' && opts.defaultPath) ? String(opts.defaultPath) : undefined;
     const result = await dialog.showOpenDialog(mainWindow, {
         properties: ['openDirectory'],
-        title: 'Müzik Klasörü Seç'
+        title,
+        defaultPath
     });
 
     if (result.canceled || result.filePaths.length === 0) {
@@ -747,6 +1287,207 @@ ipcMain.handle('dialog:openFiles', async (event, filters) => {
         path: filePath,
         name: path.basename(filePath)
     }));
+});
+
+// ============================================================
+// WEB SECURITY / PRIVACY
+// ============================================================
+ipcMain.handle('web:openExternal', async (_event, url) => {
+    const u = String(url || '').trim();
+    if (!u) return false;
+    try {
+        await shell.openExternal(u);
+        return true;
+    } catch (e) {
+        console.error('[WEB] openExternal error:', e);
+        return false;
+    }
+});
+
+ipcMain.handle('web:clearData', async (_event, options) => {
+    const opts = (options && typeof options === 'object') ? options : {};
+    const ses = session.defaultSession;
+    if (!ses) return false;
+
+    const wantsAll = opts.all === true;
+    const wantsCookies = wantsAll || opts.cookies === true;
+    const wantsCache = wantsAll || opts.cache === true;
+    const wantsStorage = wantsAll || opts.storage === true;
+
+    try {
+        if (wantsCache) {
+            await ses.clearCache();
+        }
+
+        const storages = [];
+        if (wantsCookies) storages.push('cookies');
+        if (wantsStorage) {
+            storages.push('localstorage', 'indexdb', 'cachestorage', 'serviceworkers');
+        }
+
+        if (storages.length) {
+            await ses.clearStorageData({ storages });
+        }
+
+        return true;
+    } catch (e) {
+        console.error('[WEB] clearData error:', e);
+        return false;
+    }
+});
+
+// ============================================================
+// DOWNLOAD (Aurivo-Dawlod / yt-dlp via Python CLI)
+// ============================================================
+ipcMain.handle('download:start', async (_event, options) => {
+    const url = String(options?.url || '').trim();
+    if (!url) throw new Error('URL boş');
+
+    const mode = options?.mode === 'audio' ? 'audio' : 'video';
+    const outputDirRaw = String(options?.outputDir || '').trim();
+    const outputDir = outputDirRaw || app.getPath('downloads');
+
+    const scriptPath = getDownloaderCliPath();
+    if (!fs.existsSync(scriptPath)) {
+        throw new Error(`Downloader script bulunamadı: ${scriptPath}`);
+    }
+
+    const args = [
+        scriptPath,
+        '--url', url,
+        '--mode', mode,
+        '--output', outputDir
+    ];
+
+    if (mode === 'video') {
+        const hRaw = String(options?.videoHeight || 'auto').trim();
+        if (hRaw && hRaw !== 'auto' && /^\d+$/.test(hRaw)) {
+            args.push('--video-height', hRaw);
+        }
+        const vcodec = String(options?.videoCodec || '').trim();
+        if (vcodec) args.push('--video-codec', vcodec);
+    } else {
+        const audioFormat = String(options?.audioFormat || 'mp3');
+        const audioQuality = String(options?.audioQuality || '192');
+        args.push('--audio-format', audioFormat, '--audio-quality', audioQuality);
+        if (options?.normalizeAudio === true) {
+            args.push('--normalize-audio');
+        }
+    }
+
+    // Advanced options (all modes)
+    const cookiesFromBrowser = String(options?.cookiesFromBrowser || '').trim();
+    if (cookiesFromBrowser) args.push('--cookies-from-browser', cookiesFromBrowser);
+
+    const cookiesFile = String(options?.cookiesFile || '').trim();
+    if (cookiesFile) args.push('--cookies', cookiesFile);
+
+    const proxy = String(options?.proxy || '').trim();
+    if (proxy) args.push('--proxy', proxy);
+
+    if (options?.useConfig === true) {
+        const configFile = String(options?.configFile || '').trim();
+        if (configFile) args.push('--config', configFile);
+    }
+
+    if (options?.showMoreFormats === true) {
+        const formatOverride = String(options?.formatOverride || '').trim();
+        if (formatOverride) args.push('--format-override', formatOverride);
+    }
+
+    if (options?.playlist === true) {
+        args.push('--playlist');
+        const pf = String(options?.playlistFilenameFormat || '').trim();
+        const pd = String(options?.playlistFoldernameFormat || '').trim();
+        if (pf) args.push('--playlist-filename-format', pf);
+        if (pd) args.push('--playlist-foldername-format', pd);
+    }
+
+    const customArgs = String(options?.customArgs || '').trim();
+    if (customArgs) args.push('--custom-args', customArgs);
+
+    const id = ++downloadSeq;
+    const send = (channel, payload) => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        mainWindow.webContents.send(channel, payload);
+    };
+
+    const proc = await spawnPythonWithFallback(args, { cwd: app.isPackaged ? process.resourcesPath : __dirname });
+    const tail = [];
+    const tailMax = 40;
+    activeDownloads.set(id, { proc, killTimer: null, tail });
+
+    let lastPercent = -1;
+    const percentRegex = /\[download\]\s+(\d+(?:\.\d+)?)%/i;
+
+    const handleLine = (line) => {
+        const s = String(line || '').trimEnd();
+        if (!s) return;
+
+        try {
+            tail.push(s);
+            if (tail.length > tailMax) tail.splice(0, tail.length - tailMax);
+        } catch { }
+
+        send('download:log', { id, line: s });
+
+        const m = percentRegex.exec(s);
+        if (m) {
+            const val = Math.max(0, Math.min(100, Math.floor(Number(m[1]))));
+            if (Number.isFinite(val) && val !== lastPercent) {
+                lastPercent = val;
+                send('download:progress', { id, percent: val });
+            }
+        }
+    };
+
+    const attachStream = (stream) => {
+        if (!stream) return;
+        let buf = '';
+        stream.on('data', (chunk) => {
+            buf += chunk.toString();
+            const parts = buf.split(/\r?\n/);
+            buf = parts.pop() || '';
+            for (const p of parts) handleLine(p);
+        });
+        stream.on('end', () => {
+            if (buf) handleLine(buf);
+            buf = '';
+        });
+    };
+
+    attachStream(proc.stdout);
+    attachStream(proc.stderr);
+
+    proc.on('close', (code) => {
+        const entry = activeDownloads.get(id);
+        if (entry?.killTimer) clearTimeout(entry.killTimer);
+        activeDownloads.delete(id);
+        const success = code === 0;
+        const lastLine = Array.isArray(entry?.tail) && entry.tail.length ? entry.tail[entry.tail.length - 1] : '';
+        send('download:done', { id, success, code, message: lastLine || '', tail: entry?.tail || [] });
+    });
+
+    return { id };
+});
+
+ipcMain.handle('download:cancel', async (_event, id) => {
+    const entry = activeDownloads.get(Number(id));
+    if (!entry?.proc) return false;
+
+    try {
+        if (entry.proc.killed) return true;
+        entry.proc.kill('SIGTERM');
+        entry.killTimer = setTimeout(() => {
+            try {
+                if (!entry.proc.killed) entry.proc.kill('SIGKILL');
+            } catch { }
+        }, 2000);
+        return true;
+    } catch (e) {
+        console.error('[DOWNLOAD] cancel error:', e);
+        return false;
+    }
 });
 
 // Dizin Okuma
@@ -823,7 +1564,32 @@ ipcMain.handle('fs:getFileInfo', async (event, filePath) => {
 
 ipcMain.handle('settings:save', async (event, settings) => {
     try {
-        await fs.promises.writeFile(getSettingsPath(), JSON.stringify(settings, null, 2));
+        const incoming = (settings && typeof settings === 'object') ? settings : {};
+
+        const deepMerge = (base, patch) => {
+            const out = (base && typeof base === 'object' && !Array.isArray(base)) ? { ...base } : {};
+            if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return out;
+            for (const [k, v] of Object.entries(patch)) {
+                if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    out[k] = deepMerge(out[k], v);
+                } else {
+                    out[k] = v;
+                }
+            }
+            return out;
+        };
+
+        let existing = {};
+        try {
+            const data = await fs.promises.readFile(getSettingsPath(), 'utf8');
+            existing = JSON.parse(data);
+        } catch {
+            existing = {};
+        }
+
+        // Merge to preserve keys written by other windows (e.g. sfx.eq32.lastPreset)
+        const merged = deepMerge(existing, incoming);
+        await writeJsonFileAtomic(getSettingsPath(), merged);
         return true;
     } catch (error) {
         console.error('Settings save error:', error);
@@ -832,26 +1598,36 @@ ipcMain.handle('settings:save', async (event, settings) => {
 });
 
 ipcMain.handle('settings:load', async () => {
-    try {
-        const data = await fs.promises.readFile(getSettingsPath(), 'utf8');
-        return JSON.parse(data);
-    } catch (error) {
-        // Varsayılan ayarlar
-        return {
-            playback: {
-                crossfadeStopEnabled: true,
-                crossfadeManualEnabled: true,
-                crossfadeAutoEnabled: false,
-                sameAlbumNoCrossfade: true,
-                crossfadeMs: 2000,
-                fadeOnPauseResume: false,
-                pauseFadeMs: 250
-            },
-            volume: 40,
-            shuffle: false,
-            repeat: false
-        };
+    const defaultSettings = {
+        playback: {
+            crossfadeStopEnabled: true,
+            crossfadeManualEnabled: true,
+            crossfadeAutoEnabled: false,
+            sameAlbumNoCrossfade: true,
+            crossfadeMs: 2000,
+            fadeOnPauseResume: false,
+            pauseFadeMs: 250
+        },
+        volume: 40,
+        shuffle: false,
+        repeat: false
+    };
+
+    // Eşzamanlı yazma anında (truncate/partial) parse hatası oluşursa kısa retry.
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const data = await fs.promises.readFile(getSettingsPath(), 'utf8');
+            return JSON.parse(data);
+        } catch (error) {
+            if (attempt < 2) {
+                await new Promise(r => setTimeout(r, 40));
+                continue;
+            }
+            return defaultSettings;
+        }
     }
+
+    return defaultSettings;
 });
 
 // Playlist Kaydet/Yükle
@@ -874,6 +1650,19 @@ ipcMain.handle('playlist:load', async () => {
     } catch (error) {
         return [];
     }
+});
+
+// System Tray State Update (renderer'dan güncel playback durumu)
+ipcMain.on('update-tray-state', (event, state) => {
+    updateTrayMenu(state);
+    if (tray && state.currentTrack) {
+        tray.setToolTip(state.currentTrack);
+    }
+});
+
+// MPRIS Metadata Update (renderer'dan media bilgileri)
+ipcMain.on('update-mpris-metadata', (event, metadata) => {
+    updateMPRISMetadata(metadata);
 });
 
 // Albüm Kapağı Çıkarma (ID3 tag'lerinden)
@@ -921,15 +1710,15 @@ ipcMain.handle('media:getAlbumArt', async (event, filePath) => {
 async function extractEmbeddedCover(filePath) {
     try {
         const ext = path.extname(filePath).toLowerCase();
-        
+
         // M4A/MP4 dosyaları için ffmpeg kullan
         if (ext === '.m4a' || ext === '.mp4' || ext === '.aac') {
             return await extractCoverWithFFmpeg(filePath);
         }
-        
+
         // Diğer formatlar için manuel ID3 okuma
         return await extractID3Cover(filePath);
-        
+
     } catch (error) {
         console.log('Cover extraction failed:', error.message);
         return null;
@@ -940,7 +1729,7 @@ async function extractEmbeddedCover(filePath) {
 async function extractCoverWithFFmpeg(filePath) {
     return new Promise((resolve) => {
         const { spawn } = require('child_process');
-        
+
         // Production'da bundled ffmpeg'i kullan, development'da system ffmpeg
         let ffmpegPath = 'ffmpeg';
         if (app.isPackaged) {
@@ -952,7 +1741,7 @@ async function extractCoverWithFFmpeg(filePath) {
                 ffmpegPath = path.join(process.resourcesPath, 'bin', 'ffmpeg');
             }
         }
-        
+
         // Windows'ta ffmpeg yoksa fallback
         if (process.platform === 'win32' && app.isPackaged) {
             if (!fs.existsSync(ffmpegPath)) {
@@ -961,7 +1750,7 @@ async function extractCoverWithFFmpeg(filePath) {
                 return;
             }
         }
-        
+
         // ffmpeg ile embedded image'ı pipe'la al
         const ffmpeg = spawn(ffmpegPath, [
             '-i', filePath,
@@ -971,17 +1760,17 @@ async function extractCoverWithFFmpeg(filePath) {
             '-vframes', '1',   // Sadece 1 frame
             'pipe:1'          // stdout'a yaz
         ]);
-        
+
         const chunks = [];
-        
+
         ffmpeg.stdout.on('data', (chunk) => {
             chunks.push(chunk);
         });
-        
+
         ffmpeg.stderr.on('data', (data) => {
             // ffmpeg stderr'ı ignore et (verbose olabilir)
         });
-        
+
         ffmpeg.on('close', (code) => {
             if (code === 0 && chunks.length > 0) {
                 const imageBuffer = Buffer.concat(chunks);
@@ -995,7 +1784,7 @@ async function extractCoverWithFFmpeg(filePath) {
             console.log('ffmpeg ile kapak bulunamadı');
             resolve(null);
         });
-        
+
         ffmpeg.on('error', (err) => {
             console.log('ffmpeg error:', err.message);
             resolve(null);
@@ -1562,6 +2351,16 @@ ipcMain.handle('audio:resetEQ', () => {
     try {
         if (!audioEngine || !isNativeAudioAvailable) return false;
         audioEngine.resetEQ();
+
+        // Reset'i kalıcı olarak da kaydet
+        updateEq32SettingsInFile({
+            bands: new Array(32).fill(0),
+            lastPreset: {
+                filename: '__flat__',
+                name: 'Düz (Flat)'
+            }
+        }).catch(() => { /* ignore */ });
+
         return true;
     } catch (error) {
         return false;
@@ -2831,6 +3630,31 @@ ipcMain.handle('eqPresets:select', async (event, filename) => {
             preset
         };
 
+        // Kalıcı olarak kaydet (tek kaynak: settings.json)
+        const bands = normalizeEq32BandsForEngine(preset?.bands);
+        const presetName = preset?.name || (filename === '__flat__' ? 'Düz (Flat)' : String(filename || ''));
+
+        await updateEq32SettingsInFile({
+            bands,
+            lastPreset: {
+                filename,
+                name: presetName
+            }
+        });
+
+        // Engine'e uygula (Ses Efektleri penceresi kapalı olsa bile geçerli olsun)
+        if (audioEngine && isNativeAudioAvailable) {
+            try {
+                if (typeof audioEngine.setEQBands === 'function') {
+                    audioEngine.setEQBands(bands);
+                } else if (typeof audioEngine.setEQBand === 'function') {
+                    bands.forEach((v, i) => audioEngine.setEQBand(i, v));
+                }
+            } catch {
+                // best-effort
+            }
+        }
+
         // Sound Effects penceresine gönder
         if (soundEffectsWindow && !soundEffectsWindow.isDestroyed()) {
             soundEffectsWindow.webContents.send('audio:eqPresetSelected', payload);
@@ -2860,4 +3684,3 @@ app.on('before-quit', () => {
         audioEngine.cleanup();
     }
 });
-

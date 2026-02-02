@@ -6,11 +6,14 @@
   "scripts": {
     "start": "ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_WAYLAND=1 OZONE_PLATFORM=wayland electron .",
     "dev": "AURIVO_DEV=1 ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_WAYLAND=1 OZONE_PLATFORM=wayland electron . --enable-logging",
+    "install:desktop:linux": "bash scripts/install-desktop-linux.sh",
+    "gen:icon:transparent": "bash scripts/generate-transparent-icon.sh",
+    "gen:win:ico": "node scripts/generate-windows-ico.js",
     "rebuild-native": "cd native && npm run rebuild",
     "verify:libs": "node native/verify-libs.js",
     "build": "node native/copy-libs.js && electron-builder",
     "build:linux": "node native/copy-libs.js linux && electron-builder --linux",
-    "build:win": "node native/copy-libs.js win32 && echo '⚠️  Windows ffmpeg binary gerekli: third_party/ffmpeg/ffmpeg.exe' && electron-builder --win zip",
+    "build:win": "node native/copy-libs.js win32 && echo '⚠️  Windows ffmpeg binary gerekli: third_party/ffmpeg/ffmpeg.exe' && electron-builder --win",
     "build:win:zip": "node native/copy-libs.js win32 && echo '⚠️  Windows ffmpeg binary gerekli: third_party/ffmpeg/ffmpeg.exe' && electron-builder --win zip",
     "build:mac": "node native/copy-libs.js darwin && electron-builder --mac"
   },
@@ -23,6 +26,8 @@
   "build": {
     "appId": "com.aurivo.mediaplayer",
     "productName": "Aurivo Media Player",
+    "icon": "icons/aurivo_alt_boldA_transparent_1024.png",
+    "artifactName": "Aurivo-${version}-${os}-${arch}.${ext}",
     "files": [
       "**/*",
       "!native/build/Release/obj.target/**",
@@ -57,6 +62,7 @@
       "maintainer": "Aurivo <support@aurivo.app>",
       "category": "AudioVideo",
       "executableName": "aurivo",
+      "icon": "icons/aurivo_alt_boldA_transparent_1024.png",
       "extraFiles": [
         {
           "from": "native/build/Release",
@@ -65,13 +71,32 @@
             "*.so",
             "*.node"
           ]
+        },
+        {
+          "from": "native-dist/aurivo-projectm-visualizer",
+          "to": "resources/native-dist/aurivo-projectm-visualizer"
+        },
+        {
+          "from": "third_party/projectm/presets",
+          "to": "resources/third_party/projectm/presets"
+        },
+        {
+          "from": "icons/aurivo_alt_boldA_transparent_1024.png",
+          "to": "resources/icons/aurivo_alt_boldA_transparent_1024.png"
+        },
+        {
+          "from": "icons/aurivo_logo.bmp",
+          "to": "resources/icons/aurivo_logo.bmp"
         }
       ]
     },
     "win": {
       "target": [
+        "nsis",
         "zip"
       ],
+      "icon": "icons/aurivo.ico",
+      "executableName": "Aurivo",
       "extraResources": [
         {
           "from": "libs/windows",
@@ -114,14 +139,21 @@
     },
     "nsis": {
       "oneClick": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Aurivo",
+      "installerIcon": "icons/aurivo.ico",
+      "uninstallerIcon": "icons/aurivo.ico"
     }
   },
   "devDependencies": {
     "electron": "^28.3.3",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "png-to-ico": "^3.0.1"
   },
   "dependencies": {
+    "mpris-service": "^2.1.2",
     "node-id3": "^0.2.9"
   }
 }

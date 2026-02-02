@@ -11,17 +11,24 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <errno.h>
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <unistd.h>
+#include <unordered_set>
 #include <vector>
 
 #include <SDL2/SDL.h>
+
+#ifdef SDL_IMAGE_MAJOR_VERSION
+#include <SDL2/SDL_image.h>
+#endif
 
 #include <SDL2/SDL_opengl.h>
 
@@ -42,6 +49,22 @@ static uint64_t nowMs() {
 }
 
 static void scheduleNextAutoSwitch();
+
+static fs::path getVisualizerConfigDir() {
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        return fs::path(xdg) / "aurivo-projectm-visualizer";
+    }
+    const char* home = std::getenv("HOME");
+    if (home && *home) {
+        return fs::path(home) / ".config" / "aurivo-projectm-visualizer";
+    }
+    return fs::temp_directory_path() / "aurivo-projectm-visualizer";
+}
+
+static fs::path getPresetPickerSettingsPath() {
+    return getVisualizerConfigDir() / "preset_picker.cfg";
+}
 
 static std::string getPresetsPath(int argc, char* argv[]) {
     for (int i = 1; i < argc - 1; i++) {
@@ -84,6 +107,14 @@ struct PresetItem {
     std::string displayName;
     bool enabled = true;
 };
+
+static std::string trimAscii(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) b++;
+    size_t e = s.size();
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) e--;
+    return s.substr(b, e - b);
+}
 
 static bool findPresetsRecursive(const std::string& rootPath, std::vector<PresetItem>& out) {
     out.clear();
@@ -200,6 +231,13 @@ struct AppState {
     int fbW = 1280;
     int fbH = 720;
 
+    // Preferred main window size.
+    // When launched from Aurivo (Electron), this is overridden by env AURIVO_VIS_MAIN_W/H
+    // so the window always opens at the app's expected default size.
+    int mainPrefW = 900;
+    int mainPrefH = 650;
+    uint64_t mainEnforceUntilMs = 0;
+
     float dpiScale = 1.0f;
     float lastDpiScale = 0.0f;
 
@@ -238,11 +276,139 @@ struct AppState {
     int delaySeconds = 15;
     uint64_t nextAutoSwitchMs = 0;
 
+    int pickerNavIndex = 0;
+    bool pickerNavScrollTo = false;
+
     ImGuiStyle baseStyle;
     std::string fontPath;
 };
 
 static AppState g;
+
+static void loadPresetPickerSettings() {
+    fs::path cfg = getPresetPickerSettingsPath();
+    std::error_code ec;
+    if (!fs::exists(cfg, ec) || !fs::is_regular_file(cfg, ec)) return;
+
+    std::ifstream in(cfg);
+    if (!in.is_open()) return;
+
+    int delay = g.delaySeconds;
+    int winW = g.pickerWinW;
+    int winH = g.pickerWinH;
+    int mainW = g.mainPrefW;
+    int mainH = g.mainPrefH;
+    std::unordered_set<std::string> enabledPaths;
+    std::string lastPresetPath;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trimAscii(line);
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+
+        const auto pos = line.find('=');
+        if (pos == std::string::npos) continue;
+        std::string key = trimAscii(line.substr(0, pos));
+        std::string val = trimAscii(line.substr(pos + 1));
+        if (key == "delaySeconds") {
+            try {
+                int v = std::stoi(val);
+                if (v >= 1 && v <= 3600) delay = v;
+            } catch (...) {
+            }
+        } else if (key == "pickerWinW") {
+            try {
+                int v = std::stoi(val);
+                if (v >= 420 && v <= 4096) winW = v;
+            } catch (...) {
+            }
+        } else if (key == "pickerWinH") {
+            try {
+                int v = std::stoi(val);
+                if (v >= 360 && v <= 4096) winH = v;
+            } catch (...) {
+            }
+        } else if (key == "mainWinW") {
+            try {
+                int v = std::stoi(val);
+                if (v >= 640 && v <= 8192) mainW = v;
+            } catch (...) {
+            }
+        } else if (key == "mainWinH") {
+            try {
+                int v = std::stoi(val);
+                if (v >= 480 && v <= 8192) mainH = v;
+            } catch (...) {
+            }
+        } else if (key == "enabled") {
+            if (!val.empty()) enabledPaths.insert(val);
+        } else if (key == "lastPreset") {
+            lastPresetPath = val;
+        }
+    }
+
+    g.delaySeconds = delay;
+    g.pickerWinW = winW;
+    g.pickerWinH = winH;
+    g.mainPrefW = mainW;
+    g.mainPrefH = mainH;
+
+    if (!enabledPaths.empty()) {
+        for (auto& p : g.presets) p.enabled = false;
+        for (auto& p : g.presets) {
+            if (enabledPaths.count(p.path)) p.enabled = true;
+        }
+    }
+
+    if (!lastPresetPath.empty()) {
+        for (int i = 0; i < (int)g.presets.size(); i++) {
+            if (g.presets[i].path == lastPresetPath) {
+                g.currentPreset = i;
+                break;
+            }
+        }
+    }
+}
+
+static void savePresetPickerSettings() {
+    fs::path cfg = getPresetPickerSettingsPath();
+    fs::path dir = cfg.parent_path();
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    fs::path tmp = cfg;
+    tmp += ".tmp";
+
+    std::ofstream out(tmp);
+    if (!out.is_open()) return;
+
+    out << "# Aurivo projectM visualizer preset picker\n";
+    out << "delaySeconds=" << g.delaySeconds << "\n";
+    out << "pickerWinW=" << g.pickerWinW << "\n";
+    out << "pickerWinH=" << g.pickerWinH << "\n";
+    out << "mainWinW=" << g.mainPrefW << "\n";
+    out << "mainWinH=" << g.mainPrefH << "\n";
+    if (g.currentPreset >= 0 && g.currentPreset < (int)g.presets.size()) {
+        out << "lastPreset=" << g.presets[g.currentPreset].path << "\n";
+    }
+    for (const auto& p : g.presets) {
+        if (p.enabled) out << "enabled=" << p.path << "\n";
+    }
+    out.flush();
+    out.close();
+
+    fs::rename(tmp, cfg, ec);
+    if (ec) {
+        fs::remove(cfg, ec);
+        ec.clear();
+        fs::rename(tmp, cfg, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
+        }
+    }
+}
 
 static inline uint32_t readU32LE(const uint8_t* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -355,6 +521,33 @@ static void updateDrawable() {
     g.dpiScale = (g.winW > 0) ? ((float)g.fbW / (float)g.winW) : 1.0f;
 }
 
+static void enforceMainWindowInitialSize() {
+    if (!g.window) return;
+    if (g.mainEnforceUntilMs == 0) return;
+    uint64_t t = nowMs();
+    if (t > g.mainEnforceUntilMs) {
+        g.mainEnforceUntilMs = 0;
+        return;
+    }
+
+    const Uint32 flags = SDL_GetWindowFlags(g.window);
+    const bool isFullscreen = (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) || (flags & SDL_WINDOW_FULLSCREEN);
+    if (isFullscreen) return;
+
+    int w = 0, h = 0;
+    SDL_GetWindowSize(g.window, &w, &h);
+    if (std::abs(w - g.mainPrefW) <= 2 && std::abs(h - g.mainPrefH) <= 2) {
+        g.mainEnforceUntilMs = 0;
+        return;
+    }
+
+    // Some WMs/compositors apply their own initial size after creation.
+    // Force our preferred size briefly on startup.
+    SDL_RestoreWindow(g.window);
+    SDL_SetWindowSize(g.window, g.mainPrefW, g.mainPrefH);
+    SDL_SetWindowPosition(g.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+
 static void updateDrawablePicker() {
     if (!g.pickerWindow) return;
     SDL_GetWindowSize(g.pickerWindow, &g.pickerWinW, &g.pickerWinH);
@@ -453,25 +646,42 @@ static void scheduleNextAutoSwitch() {
 }
 
 static void pumpAutoPresetSwitch() {
-    if (g.delaySeconds < 5) return;
+    if (g.delaySeconds < 1) return;
     if (!g.pm) return;
+    if (g.presets.empty()) return;
 
-    auto enabled = enabledPresetIndices();
-    if ((int)enabled.size() < 2) return;
+    int enabledCount = 0;
+    int firstEnabled = -1;
+    for (int i = 0; i < (int)g.presets.size(); i++) {
+        if (g.presets[i].enabled) {
+            enabledCount++;
+            if (firstEnabled < 0) firstEnabled = i;
+        }
+    }
+
+    if (enabledCount <= 0) return;
+
+    // If exactly one preset is enabled, stay on it (but recover if current isn't that one).
+    if (enabledCount == 1) {
+        if (firstEnabled >= 0 && g.currentPreset != firstEnabled) {
+            requestPresetPreview(firstEnabled);
+        }
+        return;
+    }
 
     uint64_t t = nowMs();
     if (g.nextAutoSwitchMs == 0) scheduleNextAutoSwitch();
     if (t < g.nextAutoSwitchMs) return;
 
-    int tries = 16;
-    while (tries-- > 0) {
-        int pick = enabled[rand() % enabled.size()];
-        if (pick != g.currentPreset) {
-            requestPresetPreview(pick);
-            break;
-        }
+    int next = g.currentPreset;
+    for (int step = 0; step < (int)g.presets.size(); step++) {
+        next = (next + 1) % (int)g.presets.size();
+        if (g.presets[next].enabled) break;
     }
 
+    if (next != g.currentPreset && g.presets[next].enabled) {
+        requestPresetPreview(next);
+    }
     scheduleNextAutoSwitch();
 }
 
@@ -722,31 +932,140 @@ static void drawPresetPicker() {
                                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::Begin("##AurivoPickerRoot", nullptr, rootFlags);
 
-    // Centered header inside the window.
-    {
-        const char* title = "Aurivo Görselleri Seç";
-        float tw = ImGui::CalcTextSize(title).x;
-        float avail = ImGui::GetContentRegionAvail().x;
-        float x = ImGui::GetCursorPosX() + std::max(0.0f, (avail - tw) * 0.5f);
-        ImGui::SetCursorPosX(x);
-        ImGui::TextUnformatted(title);
-        ImGui::Separator();
-    }
+    // Avoid duplicating the OS window title by repeating it inside the client area.
+    ImGui::TextDisabled("Otomatik geçiş için görselleri işaretleyin");
+    ImGui::Separator();
 
     ImGui::Text("Preset dizini:");
     ImGui::SameLine();
     ImGui::TextDisabled("(%d preset)", (int)g.presets.size());
 
-    int delay = g.delaySeconds;
-    if (ImGui::SliderInt("Gecikme (sn)", &delay, 5, 120)) {
-        g.delaySeconds = delay;
-        scheduleNextAutoSwitch();
+    // Keyboard navigation (Up/Down moves the same blue selection you get with mouse click)
+    if (ImGui::IsWindowAppearing()) {
+        g.pickerNavIndex = std::clamp(g.currentPreset, 0, (int)g.presets.size() - 1);
+        g.pickerNavScrollTo = true;
+    }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+            g.pickerNavIndex = std::max(0, g.pickerNavIndex - 1);
+            g.pickerNavScrollTo = true;
+            g.currentPreset = g.pickerNavIndex;
+            requestPresetPreview(g.pickerNavIndex);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+            g.pickerNavIndex = std::min((int)g.presets.size() - 1, g.pickerNavIndex + 1);
+            g.pickerNavScrollTo = true;
+            g.currentPreset = g.pickerNavIndex;
+            requestPresetPreview(g.pickerNavIndex);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Space)) {
+            if (g.pickerNavIndex >= 0 && g.pickerNavIndex < (int)g.presets.size()) {
+                g.presets[g.pickerNavIndex].enabled = !g.presets[g.pickerNavIndex].enabled;
+            }
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+            g.currentPreset = g.pickerNavIndex;
+            requestPresetPreview(g.pickerNavIndex);
+        }
+    }
+
+    // Delay control: thin "time bar" style.
+    const float scale = (g.pickerWindow ? g.pickerDpiScale : g.dpiScale);
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const char* label = "Gecikme (sn)";
+        float labelW = ImGui::CalcTextSize(label).x;
+        float availW = ImGui::GetContentRegionAvail().x;
+        float gap = std::max(10.0f, 14.0f * scale);
+
+        float barW = std::max(160.0f, availW - labelW - gap);
+        float barH = std::max(8.0f, 10.0f * scale);
+        float knobR = std::max(5.0f, 7.0f * scale);
+        float borderR = std::max(3.0f, 5.0f * scale);
+
+        ImVec2 barPos = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##delay_bar", ImVec2(barW, barH + std::max(6.0f, 8.0f * scale)));
+        bool hovered = ImGui::IsItemHovered();
+        bool active = ImGui::IsItemActive();
+
+        int delay = g.delaySeconds;
+        int minV = 5;
+        int maxV = 120;
+        float t = (maxV > minV) ? (float)(delay - minV) / (float)(maxV - minV) : 0.0f;
+        t = std::clamp(t, 0.0f, 1.0f);
+
+        if (active) {
+            float mx = ImGui::GetIO().MousePos.x;
+            float newT = (barW > 1.0f) ? (mx - barPos.x) / barW : 0.0f;
+            newT = std::clamp(newT, 0.0f, 1.0f);
+            int newDelay = (int)std::lround(minV + newT * (float)(maxV - minV));
+            if (newDelay != delay) {
+                g.delaySeconds = newDelay;
+                scheduleNextAutoSwitch();
+                delay = newDelay;
+                t = newT;
+            }
+        }
+
+        // Colors: animated hue shift (color cycle like main app's progress bar)
+        float timeS = (float)nowMs() / 1000.0f;
+        float pulse = 0.5f + 0.5f * std::sin(timeS * 2.2f);
+        float hue = std::fmod(timeS * 0.15f, 1.0f); // Slow rainbow cycle
+        
+        auto hsvToRgb = [](float h, float s, float v) -> ImVec4 {
+            float c = v * s;
+            float x = c * (1.0f - std::fabs(std::fmod(h * 6.0f, 2.0f) - 1.0f));
+            float m = v - c;
+            float r = 0, g = 0, b = 0;
+            if (h < 1.0f/6.0f) { r = c; g = x; }
+            else if (h < 2.0f/6.0f) { r = x; g = c; }
+            else if (h < 3.0f/6.0f) { g = c; b = x; }
+            else if (h < 4.0f/6.0f) { g = x; b = c; }
+            else if (h < 5.0f/6.0f) { r = x; b = c; }
+            else { r = c; b = x; }
+            return ImVec4(r + m, g + m, b + m, 1.0f);
+        };
+        
+        ImVec4 fillColor = hsvToRgb(hue, 0.75f, 0.95f);
+        ImVec4 glowColor = hsvToRgb(hue, 0.6f, 0.8f);
+        ImVec4 knobColor = hsvToRgb(hue, 0.85f, 1.0f);
+        
+        ImU32 bg = IM_COL32(28, 28, 28, 255);
+        ImU32 track = IM_COL32(60, 60, 60, 255);
+        ImU32 fill = IM_COL32((int)(fillColor.x * 255), (int)(fillColor.y * 255), (int)(fillColor.z * 255), 220);
+        ImU32 glow = IM_COL32((int)(glowColor.x * 255), (int)(glowColor.y * 255), (int)(glowColor.z * 255), (int)(40 + pulse * 80));
+        ImU32 knob = IM_COL32(245, 245, 245, 230);
+        ImU32 knobFill = IM_COL32((int)(knobColor.x * 255), (int)(knobColor.y * 255), (int)(knobColor.z * 255), 255);
+
+        ImVec2 p0(barPos.x, barPos.y + std::max(3.0f, 4.0f * scale));
+        ImVec2 p1(barPos.x + barW, p0.y + barH);
+        dl->AddRectFilled(p0, p1, bg, borderR);
+        dl->AddRect(p0, p1, hovered ? IM_COL32(120, 120, 120, 255) : track, borderR, 0, 1.0f);
+
+        ImVec2 fill1(p0.x + barW * t, p1.y);
+        dl->AddRectFilled(p0, fill1, fill, borderR);
+        if (hovered || active) {
+            dl->AddRect(ImVec2(p0.x - 1, p0.y - 1), ImVec2(p1.x + 1, p1.y + 1), glow, borderR + 1.0f, 0, 2.0f);
+        }
+
+        float knobX = p0.x + barW * t;
+        float knobY = (p0.y + p1.y) * 0.5f;
+        dl->AddCircleFilled(ImVec2(knobX, knobY), knobR + 1.2f, hovered ? knobFill : fill);
+        dl->AddCircleFilled(ImVec2(knobX, knobY), knobR, knob);
+
+        // Value text centered on the bar
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%d", g.delaySeconds);
+        ImVec2 tw = ImGui::CalcTextSize(buf);
+        ImVec2 tc((p0.x + p1.x - tw.x) * 0.5f, (p0.y + p1.y - tw.y) * 0.5f);
+        dl->AddText(tc, IM_COL32(235, 235, 235, 230), buf);
+
+        // Label on the right, same line
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + gap);
+        ImGui::TextUnformatted(label);
     }
 
     ImGui::Separator();
 
     // Scrollable list area (leave room for bottom buttons)
-    const float scale = (g.pickerWindow ? g.pickerDpiScale : g.dpiScale);
     const float rowH = std::max(18.0f, 26.0f * scale);
     const float padX = std::max(4.0f, 8.0f * scale);
     const float gap = std::max(6.0f, 10.0f * scale);
@@ -771,6 +1090,7 @@ static void drawPresetPicker() {
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++) {
                 PresetItem& p = g.presets[i];
                 const bool isCurrent = (i == g.currentPreset);
+                const bool isNav = (i == g.pickerNavIndex);
 
                 ImGui::PushID(i);
 
@@ -834,6 +1154,9 @@ static void drawPresetPicker() {
 
                 if (rowClicked) {
                     // Single click on text region: preview/current preset changes only.
+                    g.pickerNavIndex = i;
+                    g.pickerNavScrollTo = true;
+                    g.currentPreset = i;
                     requestPresetPreview(i);
                 }
 
@@ -854,6 +1177,11 @@ static void drawPresetPicker() {
 
                 // Advance cursor to next row
                 ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y));
+
+                if (isNav && g.pickerNavScrollTo) {
+                    ImGui::SetScrollHereY(0.35f);
+                    g.pickerNavScrollTo = false;
+                }
                 ImGui::PopID();
             }
         }
@@ -926,18 +1254,34 @@ static bool ensurePickerWindow() {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
+    // Clamp requested size to the usable display area and enforce it after creation.
+    int desiredW = g.pickerWinW;
+    int desiredH = g.pickerWinH;
+    int displayIndex = (g.window ? SDL_GetWindowDisplayIndex(g.window) : 0);
+    SDL_Rect usable{0, 0, 0, 0};
+    if (SDL_GetDisplayUsableBounds(displayIndex, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+        desiredW = std::clamp(desiredW, 420, (int)(usable.w * 0.95f));
+        desiredH = std::clamp(desiredH, 360, (int)(usable.h * 0.95f));
+    } else {
+        desiredW = std::clamp(desiredW, 420, 1920);
+        desiredH = std::clamp(desiredH, 360, 1080);
+    }
+
     g.pickerWindow = SDL_CreateWindow(
         "Aurivo Görselleri Seç",
         wx + ww + 18,
         wy + 42,
-        g.pickerWinW,
-        g.pickerWinH,
+        desiredW,
+        desiredH,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
     if (!g.pickerWindow) {
         std::cerr << "Failed to create picker window: " << SDL_GetError() << std::endl;
         return false;
     }
+
+    // Some WMs may restore a previous size; force the requested size.
+    SDL_SetWindowSize(g.pickerWindow, desiredW, desiredH);
 
     if (!tryCreateContextForWindow(g.pickerWindow, g.pickerGL)) {
         if (backupWindow && backupContext) SDL_GL_MakeCurrent(backupWindow, backupContext);
@@ -1029,6 +1373,12 @@ static bool initSDLVideo() {
         return false;
     }
 
+    // WM_CLASS / Wayland app_id: match main app for taskbar/dock grouping
+    const char* wmclass = std::getenv("AURIVO_VIS_WMCLASS");
+    if (!wmclass || !*wmclass) wmclass = "aurivo-media-player";
+    SDL_SetHint("SDL_VIDEO_X11_WMCLASS", wmclass);
+    SDL_SetHint("SDL_VIDEO_WAYLAND_WMCLASS", wmclass);
+
     const char* driver = SDL_GetCurrentVideoDriver();
     std::cout << "Video driver: " << (driver ? driver : "unknown") << std::endl;
     return true;
@@ -1053,17 +1403,51 @@ static bool initMainWindowAndGL() {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
+    // Pick a sane initial size (some WMs may try to restore/maximize based on WM_CLASS).
+    int desiredW = g.mainPrefW;
+    int desiredH = g.mainPrefH;
+    SDL_Rect usable{0, 0, 0, 0};
+    if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+        desiredW = std::clamp(desiredW, 640, (int)(usable.w * 0.95f));
+        desiredH = std::clamp(desiredH, 480, (int)(usable.h * 0.95f));
+    }
+
     g.window = SDL_CreateWindow(
         "Aurivo Visualizer",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
-        g.winW,
-        g.winH,
+        desiredW,
+        desiredH,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
     if (!g.window) {
         std::cerr << "Failed to create window: " << SDL_GetError() << std::endl;
         return false;
+    }
+
+    // Force initial size (prevents "opens maximized" on some desktops).
+    SDL_RestoreWindow(g.window);
+    SDL_SetWindowSize(g.window, desiredW, desiredH);
+    SDL_SetWindowPosition(g.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+
+    // Briefly enforce the preferred size after the window is shown, because some WMs
+    // apply their own maximize/restore after creation.
+    g.mainEnforceUntilMs = nowMs() + 1500ULL;
+
+    // Set window icon from env (passed by main process)
+    if (const char* iconPath = std::getenv("AURIVO_VISUALIZER_ICON")) {
+        SDL_Surface* iconSurf = nullptr;
+#ifdef SDL_IMAGE_MAJOR_VERSION
+        iconSurf = IMG_Load(iconPath);
+#else
+        iconSurf = SDL_LoadBMP(iconPath);
+#endif
+        if (iconSurf) {
+            SDL_SetWindowIcon(g.window, iconSurf);
+            SDL_FreeSurface(iconSurf);
+        } else {
+            std::cerr << "[Icon] failed to load: " << iconPath << " (" << SDL_GetError() << ")" << std::endl;
+        }
     }
 
     // Try GL 3.3 core first.
@@ -1192,6 +1576,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Load picker settings AFTER scanning presets so we can map saved paths back to indices.
+    loadPresetPickerSettings();
+
+    // If the parent app provides a default size, prefer it (open at this size every time).
+    if (const char* w = std::getenv("AURIVO_VIS_MAIN_W")) {
+        try {
+            int v = std::stoi(std::string(w));
+            if (v >= 640 && v <= 8192) g.mainPrefW = v;
+        } catch (...) {
+        }
+    }
+    if (const char* h = std::getenv("AURIVO_VIS_MAIN_H")) {
+        try {
+            int v = std::stoi(std::string(h));
+            if (v >= 480 && v <= 8192) g.mainPrefH = v;
+        } catch (...) {
+        }
+    }
+
     if (!initSDLVideo()) return 1;
     if (!initMainWindowAndGL()) {
         shutdownAll();
@@ -1221,12 +1624,13 @@ int main(int argc, char* argv[]) {
     if (!initStdinNonBlocking()) {
         std::cerr << "[Audio] stdin non-blocking setup failed; PCM feed may stutter." << std::endl;
     } else {
-        std::cout << "[Audio] waiting for app PCM on stdin (v2 protocol)." << std::endl;
+        std::cout << "[Audio] ✓ projectM input = aurivo_pcm (stdin only, NO mic/capture)" << std::endl;
     }
 
     // Ensure main GL context is current before loading the first preset.
     SDL_GL_MakeCurrent(g.window, g.gl);
-    applyPresetByIndexNow(0);
+    g.currentPreset = std::clamp(g.currentPreset, 0, (int)g.presets.size() - 1);
+    applyPresetByIndexNow(g.currentPreset);
     scheduleNextAutoSwitch();
 
     SDL_Event e;
@@ -1260,8 +1664,40 @@ int main(int argc, char* argv[]) {
                 } else {
                     g.running = false;
                 }
+            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                // Double-click on the main visualizer toggles fullscreen.
+                if (g.window && e.button.windowID == SDL_GetWindowID(g.window) && e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2) {
+                    ImGui::SetCurrentContext(g.mainImGui);
+                    ImGuiIO& io = ImGui::GetIO();
+                    if (!io.WantCaptureMouse) {
+                        g.fullscreen = !g.fullscreen;
+                        SDL_SetWindowFullscreen(g.window, g.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    }
+                }
+            } else if (e.type == SDL_WINDOWEVENT) {
+                // Track user resize of the main window (persist only when not maximized/fullscreen)
+                if (g.window && e.window.windowID == SDL_GetWindowID(g.window)) {
+                    if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESIZED) {
+                        const Uint32 flags = SDL_GetWindowFlags(g.window);
+                        const bool isFullscreen = (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) || (flags & SDL_WINDOW_FULLSCREEN);
+                        const bool isMaximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+                        if (!isFullscreen && !isMaximized) {
+                            g.mainPrefW = std::clamp((int)e.window.data1, 640, 8192);
+                            g.mainPrefH = std::clamp((int)e.window.data2, 480, 8192);
+                        }
+                    }
+                }
             }
         }
+
+        enforceMainWindowInitialSize();
+
+        // Persist picker settings on close (Tamam / ESC / window close button).
+        static bool wasPickerOpen = false;
+        if (wasPickerOpen && !g.showPresetPicker) {
+            savePresetPickerSettings();
+        }
+        wasPickerOpen = g.showPresetPicker;
 
         // Create/destroy picker window based on state.
         if (g.showPresetPicker) {

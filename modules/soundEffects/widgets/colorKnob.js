@@ -12,6 +12,9 @@ class ColorKnob {
         this.decimals = config.decimals !== undefined ? config.decimals : 1;
         this.suffix = config.suffix || ' dB'; // dB, %, etc.
         this.wheelStep = config.wheelStep || 0.5;
+        // Drag sensitivity: if set, dragging across this many pixels covers full range
+        // (useful for large-range controls like PEQ frequency).
+        this.dragRangePx = Number.isFinite(config.dragRangePx) ? config.dragRangePx : null;
 
         // State variables matching C++ implementation
         this.shift = 0;
@@ -156,24 +159,33 @@ class ColorKnob {
             // ClientY increases DOWN. So lastY - currY is correct for "Drag Up to Increase".
             
             let effectiveDelta = dy + dx * 0.35;
-            
+
+            // If dragRangePx is configured, map drag distance to full range.
+            if (this.dragRangePx && this.dragRangePx > 0) {
+                let dragRangePx = this.dragRangePx;
+                if (e.shiftKey) dragRangePx *= 2.5;
+
+                const range = this.maxValue - this.minValue;
+                const valueDelta = (effectiveDelta / dragRangePx) * range;
+
+                if (Math.abs(valueDelta) >= this.stepSize) {
+                    const newValue = this.value + valueDelta;
+                    this.setValue(newValue, true);
+                    this.dragStartGlobal = { x: e.clientX, y: e.clientY };
+                }
+                return;
+            }
+
+            // Default (legacy) drag behavior: pixels -> steps -> stepSize
             let pixelsPerStep = 3.0; // From C++
             if (e.shiftKey) pixelsPerStep *= 2.5;
-            
+
             const steps = effectiveDelta / pixelsPerStep;
-            
-            // We apply delta and reset reference point to avoid "jumping" or accumulating too much?
-            // C++ implementation updates m_lastPos every move event.
-            // So it's incremental.
-            
-            if (Math.abs(steps) >= 1) { // Only update if significant enough? Or float update?
-                // C++ does float update directly
-                 const newValue = this.value + steps * this.stepSize;
-                 this.setValue(newValue, true); // Instant update on Drag
-                 
-                 // Reset reference only if we consumed the movement?
-                 // No, C++ updates lastPos always.
-                 this.dragStartGlobal = { x: e.clientX, y: e.clientY };
+
+            if (Math.abs(steps) >= 1) {
+                const newValue = this.value + steps * this.stepSize;
+                this.setValue(newValue, true);
+                this.dragStartGlobal = { x: e.clientX, y: e.clientY };
             }
         }
     }

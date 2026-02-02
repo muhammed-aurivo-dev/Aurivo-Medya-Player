@@ -11,6 +11,16 @@ find_package(PkgConfig REQUIRED)
 find_package(SDL2 REQUIRED)
 include_directories(${SDL2_INCLUDE_DIRS})
 
+# Try to find SDL2_image (optional; fallback to BMP if not available)
+pkg_check_modules(SDL2_IMAGE sdl2_image)
+if(SDL2_IMAGE_FOUND)
+    include_directories(${SDL2_IMAGE_INCLUDE_DIRS})
+    link_directories(${SDL2_IMAGE_LIBRARY_DIRS})
+    message(STATUS "SDL2_image found; will use IMG_Load for icon")
+else()
+    message(STATUS "SDL2_image not found; will use SDL_LoadBMP fallback")
+endif()
+
 
 # Find OpenGL
 find_package(OpenGL REQUIRED)
@@ -47,6 +57,10 @@ target_compile_definitions(imgui PRIVATE
     IMGUI_IMPL_OPENGL_LOADER_CUSTOM
 )
 
+if(SDL2_IMAGE_FOUND)
+    target_compile_definitions(imgui PUBLIC SDL_IMAGE_MAJOR_VERSION=2)
+endif()
+
 target_link_libraries(imgui PUBLIC
     ${SDL2_LIBRARIES}
     ${OPENGL_LIBRARIES}
@@ -66,6 +80,11 @@ target_link_libraries(aurivo-projectm-visualizer
     projectM-4-playlist
     pthread
 )
+
+if(SDL2_IMAGE_FOUND)
+    target_link_libraries(aurivo-projectm-visualizer ${SDL2_IMAGE_LIBRARIES})
+    target_compile_definitions(aurivo-projectm-visualizer PRIVATE SDL_IMAGE_MAJOR_VERSION=2)
+endif()
 
 # Installation
 install(TARGETS aurivo-projectm-visualizer

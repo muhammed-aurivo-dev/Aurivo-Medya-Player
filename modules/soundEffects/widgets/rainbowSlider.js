@@ -37,7 +37,7 @@ class RainbowSlider {
         this.setValue(this.targetValue); 
     }
 
-    setValue(val) {
+    setValue(val, opts = {}) {
         let clamped = Math.min(Math.max(val, this.minValue), this.maxValue);
         if (this.stepSize > 0) {
             clamped = Math.round(clamped / this.stepSize) * this.stepSize;
@@ -45,10 +45,17 @@ class RainbowSlider {
         }
         
         this.targetValue = clamped;
+
+        // Programmatic updates (UI hydration, preset apply) should not trigger onChange
+        // via the animation loop. "immediate" snaps value to target and avoids notify.
+        if (opts && opts.immediate) {
+            this.value = this.targetValue;
+            return;
+        }
         
         // Instant update if uninitialized
         if (Math.abs(this.value - this.targetValue) > (this.maxValue - this.minValue)) {
-             this.value = this.targetValue;
+            this.value = this.targetValue;
         }
     }
 

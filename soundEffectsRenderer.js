@@ -15,6 +15,10 @@ const SFX = {
     barAnalyzer: null,
     eqResponse: null,
     autoGainInterval: null,  // Auto Gain periyodik güncelleme timer'ı
+    suppressEq32SliderEvents: false,
+    eq32PersistTimer: null,
+    eq32PersistInFlight: false,
+    crossfeedStatusInterval: null,
 
     // 32-Band EQ Frekansları
     eqFrequencies: [
@@ -187,6 +191,70 @@ const SFX = {
     }
 }
 
+// RAM öncelikli mod: sekme değişince eski panel DOM'unu boşalt
+const RAM_PRIORITY_MODE = true;
+
+// EQ debug loglarını kapat/aç
+const DEBUG_EQ = false;
+
+function dbgEq(...args) {
+    if (DEBUG_EQ) console.log(...args);
+}
+
+function safeNormalizeEq32Settings(settings) {
+    const s = settings || {};
+    s.bands = normalize32Bands(s.bands);
+    if (!Number.isFinite(s.balance)) s.balance = 0;
+    if (!Number.isFinite(s.bass)) s.bass = 0;
+    if (!Number.isFinite(s.mid)) s.mid = 0;
+    if (!Number.isFinite(s.treble)) s.treble = 0;
+    if (!Number.isFinite(s.stereoExpander)) s.stereoExpander = 100;
+    if (!('acousticSpace' in s)) s.acousticSpace = 'off';
+    return s;
+}
+
+function updateEq32UIFromSettings(settings) {
+    const bands = Array.isArray(settings?.bands) ? settings.bands : new Array(32).fill(0);
+
+    // Sliderlar + değer etiketleri
+    if (SFX.eqSliders && SFX.eqSliders.length > 0) {
+        SFX.suppressEq32SliderEvents = true;
+        try {
+            for (let i = 0; i < 32; i++) {
+                const slider = SFX.eqSliders[i];
+                if (slider) slider.setValue(bands[i], { immediate: true });
+                const valueEl = document.getElementById(`eqValue${i}`);
+                if (valueEl) valueEl.textContent = `${Number(bands[i]).toFixed(1)}d`;
+            }
+        } finally {
+            SFX.suppressEq32SliderEvents = false;
+        }
+    }
+
+    // Eğri
+    if (SFX.eqResponse) {
+        SFX.eqResponse.setBandValues(bands);
+    }
+}
+
+function schedulePersistEq32ToAppSettings(eq32Settings) {
+    if (!window.aurivo?.loadSettings || !window.aurivo?.saveSettings) return;
+
+    // Sürekli slider hareketinde dosya yazımını boğmamak için debounce
+    if (SFX.eq32PersistTimer) clearTimeout(SFX.eq32PersistTimer);
+    SFX.eq32PersistTimer = setTimeout(async () => {
+        if (SFX.eq32PersistInFlight) return;
+        SFX.eq32PersistInFlight = true;
+        try {
+            await persistEq32ToAppSettings(eq32Settings);
+        } catch {
+            // ignore
+        } finally {
+            SFX.eq32PersistInFlight = false;
+        }
+    }, 250);
+}
+
 // ============================================
 // INITIALIZATION
 // ============================================
@@ -195,17 +263,17 @@ document.addEventListener('DOMContentLoaded', () => {
         initEffects();
         setupEventListeners();
         setupEQPresetListener();
-        loadAllSettings();
+        loadAllSettings(['eq32']);
 
         // Uygulama ayarlarından EQ32'yi geri yükle (varsa) ve DSP'ye uygula
         await hydrateEq32FromAppSettings();
         applyEffect('eq32');
-        updateEqPresetButtonLabel();
 
-        // İlk efekti göster
+        // İlk efekti göster (paneli lazy-load eder)
         showEffect('eq32');
-    })().catch(() => {
-        // Sessizce devam
+        updateEqPresetButtonLabel();
+    })().catch((e) => {
+        console.warn('[SFX INIT] Başlatma hatası (devam ediliyor):', e?.message || e);
         updateEqPresetButtonLabel();
         showEffect('eq32');
     });
@@ -312,25 +380,76 @@ function createAllEffectPanels() {
         'echo', 'convreverb', 'peq', 'autogain', 'truepeak', 'crossfeed', 'bassmono', 'dynamiceq', 'tapesat', 'bitdither'
     ];
 
-    // Tüm panelleri tek seferde oluştur
+    // Başlangıçta SADECE wrapper'ları oluştur (içerik lazy-load)
     let allPanelsHTML = '';
     effectNames.forEach(name => {
-        const template = getEffectTemplate(name);
-        // Her paneli wrapper div içine koy ve başlangıçta gizle (eq32 hariç)
-        allPanelsHTML += `<div class="effect-panel-wrapper" data-effect="${name}" style="display: none;">${template}</div>`;
+        allPanelsHTML += `<div class="effect-panel-wrapper" data-effect="${name}" data-rendered="false" style="display: none;"></div>`;
     });
 
     contentArea.innerHTML = allPanelsHTML;
+    console.log('✓ Efekt wrapper\'ları oluşturuldu (lazy-load)');
+}
 
-    // Tüm paneller için event listener'ları bir kerede kur
-    effectNames.forEach(name => {
-        initEffectControls(name);
+function ensureEffectPanelRendered(effectName) {
+    const wrapper = document.querySelector(`.effect-panel-wrapper[data-effect="${effectName}"]`);
+    if (!wrapper) return;
+    if (wrapper.dataset.rendered === 'true') return;
+
+    const template = getEffectTemplate(effectName);
+    wrapper.innerHTML = template;
+    wrapper.dataset.rendered = 'true';
+
+    initEffectControls(effectName);
+}
+
+function unloadEffectPanel(effectName) {
+    const wrapper = document.querySelector(`.effect-panel-wrapper[data-effect="${effectName}"]`);
+    if (!wrapper) return;
+    if (wrapper.dataset.rendered !== 'true') return;
+
+    // UI-only timer/loop cleanup
+    if (effectName === 'truepeak') stopTruePeakMeter();
+    if (effectName === 'compressor') stopCompressorMeter();
+    if (effectName === 'limiter') stopLimiterMeter();
+    if (effectName === 'autogain') stopAutoGainMeter();
+
+    if (effectName === 'crossfeed') {
+        if (SFX.crossfeedStatusInterval) {
+            clearInterval(SFX.crossfeedStatusInterval);
+            SFX.crossfeedStatusInterval = null;
+        }
+    }
+
+    // Instance referanslarını bırak
+    if (effectName === 'eq32') {
+        SFX.eqSliders = [];
+        SFX.barAnalyzer = null;
+        SFX.eqResponse = null;
+
+        delete SFX.knobInstances['bass'];
+        delete SFX.knobInstances['mid'];
+        delete SFX.knobInstances['treble'];
+        delete SFX.knobInstances['stereoExpander'];
+
+        // eq32 yeniden açılınca kontroller tekrar init edilsin
+        eq32ControlsInitialized = false;
+    }
+
+    // Generic knobs: effectName_ ile başlayanları sil
+    Object.keys(SFX.knobInstances).forEach(k => {
+        if (k.startsWith(`${effectName}_`)) delete SFX.knobInstances[k];
     });
 
-    console.log('✓ Tüm efekt panelleri oluşturuldu');
+    wrapper.innerHTML = '';
+    wrapper.dataset.rendered = 'false';
 }
 
 function showEffect(effectName) {
+    const prevEffect = SFX.currentEffect;
+
+    // Panel içeriklerini ilk ihtiyaçta oluştur
+    ensureEffectPanelRendered(effectName);
+
     // Sidebar aktif durumu güncelle
     document.querySelectorAll('.effect-item').forEach(item => {
         item.classList.toggle('active', item.dataset.effect === effectName);
@@ -383,6 +502,11 @@ function showEffect(effectName) {
     }
 
     SFX.currentEffect = effectName;
+
+    // RAM öncelikli: önceki paneli boşalt
+    if (RAM_PRIORITY_MODE && prevEffect && prevEffect !== effectName) {
+        unloadEffectPanel(prevEffect);
+    }
 }
 
 // PEQ Filter Type Event Listeners
@@ -2185,6 +2309,7 @@ function getGenericEffectTemplate(effectId, title, description, knobs) {
 
 // Knob'ların zaten başlatılıp başlatılmadığını takip et
 let knobsInitialized = false;
+let eq32ControlsInitialized = false;
 
 function initEffectControls(effectName) {
     // Knob'ları sadece bir kere başlat (tüm paneller için)
@@ -2196,8 +2321,14 @@ function initEffectControls(effectName) {
 
     // EQ sliders
     if (effectName === 'eq32') {
-        initEQSliders();
-        initBalanceSlider();
+        if (eq32ControlsInitialized) return;
+        eq32ControlsInitialized = true;
+
+        // İlk frame'i boş geç: UI animasyonları akıcı başlasın
+        requestAnimationFrame(() => {
+            initEQSliders();
+            initBalanceSlider();
+        });
 
         // Butonlar
         document.getElementById('eqResetBtn')?.addEventListener('click', () => resetEffect('eq32'));
@@ -2239,7 +2370,8 @@ function initEffectControls(effectName) {
 
     // Reverb presets
     if (effectName === 'reverb') {
-        document.querySelectorAll('.preset-btn').forEach(btn => {
+        const panel = document.getElementById('reverbPanel');
+        panel?.querySelectorAll('.preset-btn')?.forEach(btn => {
             btn.addEventListener('click', () => applyReverbPreset(btn.dataset.preset));
         });
     }
@@ -2297,8 +2429,9 @@ function initEffectControls(effectName) {
             });
         }
 
-        // Presets
-        document.querySelectorAll('.preset-btn').forEach(btn => {
+        // Presets (sadece truepeak paneli içinde)
+        const panel = document.getElementById('truepeakPanel');
+        panel?.querySelectorAll('.preset-btn')?.forEach(btn => {
             btn.addEventListener('click', () => {
                 const preset = btn.dataset.preset;
                 applyTruePeakPreset(preset);
@@ -2354,7 +2487,10 @@ function initGenericKnobs(effectName) {
             stepSize: step,
             value: val,
             suffix: ' ' + unit,
-            wheelStep: (max - min) / 40
+            wheelStep: (max - min) / 40,
+            // PEQ frequency/Q gibi geniş aralıklarda drag hissi çok yavaştı.
+            // Bu ayar, sürükleme ile tüm aralığı makul mesafede gezmeyi sağlar.
+            ...(effectName === 'peq' ? { dragRangePx: 220 } : {})
         });
 
         knob.onChange((value) => {
@@ -2533,6 +2669,7 @@ function initEQSliders() {
         });
 
         slider.onChange((value) => {
+            if (SFX.suppressEq32SliderEvents) return;
             // Değeri göster
             const valueEl = document.getElementById(`eqValue${band}`);
             if (valueEl) {
@@ -2541,6 +2678,11 @@ function initEQSliders() {
 
             // Ayarları güncelle
             const currentSettings = getSettings('eq32');
+            // Manuel değişiklik, artık preset birebir değil
+            if (currentSettings.lastPreset) {
+                currentSettings.lastPreset = null;
+                updateEqPresetButtonLabel();
+            }
             currentSettings.bands[band] = value;
             saveSettings('eq32', currentSettings);
 
@@ -2552,6 +2694,9 @@ function initEQSliders() {
             if (window.aurivo?.ipcAudio?.eq) {
                 window.aurivo.ipcAudio.eq.setBand(band, value).catch(console.error);
             }
+
+            // Kalıcı kayıt (debounce)
+            schedulePersistEq32ToAppSettings(currentSettings);
         });
 
         SFX.eqSliders[band] = slider;
@@ -2643,6 +2788,8 @@ function initBalanceSlider() {
             settings.balance = value;
             saveSettings('eq32', settings);
 
+            schedulePersistEq32ToAppSettings(settings);
+
             // IPC Audio API'ye gönder (main process'e)
             if (window.aurivo?.ipcAudio?.balance) {
                 window.aurivo.ipcAudio.balance.set(value);
@@ -2669,6 +2816,10 @@ function getSettings(effectName) {
         } catch (e) {
             SFX.settings[effectName] = { ...SFX.defaults[effectName] };
         }
+
+        if (effectName === 'eq32') {
+            SFX.settings[effectName] = safeNormalizeEq32Settings(SFX.settings[effectName]);
+        }
     }
     return SFX.settings[effectName];
 }
@@ -2682,9 +2833,12 @@ function saveSettings(effectName, settings) {
     }
 }
 
-function loadAllSettings() {
-    Object.keys(SFX.defaults).forEach(effectName => {
-        getSettings(effectName);
+function loadAllSettings(effectNames) {
+    const names = Array.isArray(effectNames) && effectNames.length > 0
+        ? effectNames
+        : Object.keys(SFX.defaults);
+    names.forEach(effectName => {
+        if (SFX.defaults[effectName]) getSettings(effectName);
     });
 }
 
@@ -2705,6 +2859,10 @@ function updateEffectParam(effectName, param, value) {
     }
 
     saveSettings(effectName, settings);
+
+    if (effectName === 'eq32') {
+        schedulePersistEq32ToAppSettings(settings);
+    }
 
     const ipcAudio = window.aurivo?.ipcAudio;
     if (!ipcAudio) return;
@@ -2916,9 +3074,14 @@ function applyEffect(effectName) {
         case 'eq32':
             // 32-Band EQ bantlarını uygula
             if (ipcAudio.eq) {
-                settings.bands.forEach((val, i) => {
-                    ipcAudio.eq.setBand(i, val);
-                });
+                const gains = normalize32Bands(settings.bands);
+                if (typeof ipcAudio.eq.setAllBands === 'function') {
+                    ipcAudio.eq.setAllBands(gains);
+                } else {
+                    gains.forEach((val, i) => {
+                        ipcAudio.eq.setBand(i, val);
+                    });
+                }
             }
             // Balance uygula
             if (ipcAudio.balance) {
@@ -3552,34 +3715,19 @@ function resetEffect(effectName) {
     if (effectName === 'eq32') {
         const settings = getSettings('eq32');
         settings.bands = new Array(32).fill(0);
-        // Düz preset'ini seç
-        settings.lastPreset = {
-            filename: '__flat__',
-            name: 'Düz (Flat)'
-        };
+        settings.lastPreset = { filename: '__flat__', name: 'Düz (Flat)' };
         saveSettings('eq32', settings);
 
-        // Uygulama ayarlarına da yaz
-        persistEq32ToAppSettings(settings).catch(() => { /* ignore */ });
         updateEqPresetButtonLabel();
 
-        // IPC Audio API'ye EQ bantlarını sıfırla
-        if (window.aurivo?.ipcAudio?.eq) {
+        // UI'yi tek seferde güncelle (onChange tetikleme yok)
+        updateEq32UIFromSettings(settings);
+
+        // Engine + settings.json reset (tek IPC)
+        if (window.aurivo?.ipcAudio?.eq?.resetBands) {
             window.aurivo.ipcAudio.eq.resetBands();
-        }
-
-        // Slider'ları güncelle
-        if (SFX.eqSliders && SFX.eqSliders.length > 0) {
-            SFX.eqSliders.forEach((slider, i) => {
-                if (slider) slider.setValue(0);
-                const valueEl = document.getElementById(`eqValue${i}`);
-                if (valueEl) valueEl.textContent = '0.0d';
-            });
-        }
-
-        // Update Curve
-        if (SFX.eqResponse) {
-            SFX.eqResponse.setBandValues(new Array(32).fill(0));
+        } else {
+            applyEffect('eq32');
         }
     } else if (effectName === 'peq') {
         // PEQ Özel Sıfırlama - 6 bant + filter type
@@ -4147,7 +4295,11 @@ function initCrossfeedControls() {
         }
     };
     updateStatus();
-    setInterval(updateStatus, 1000);
+    if (SFX.crossfeedStatusInterval) {
+        clearInterval(SFX.crossfeedStatusInterval);
+        SFX.crossfeedStatusInterval = null;
+    }
+    SFX.crossfeedStatusInterval = setInterval(updateStatus, 1000);
 }
 
 // Crossfeed Visualization güncelleme
@@ -4245,10 +4397,16 @@ function updateCrossfeedVisual() {
 // EQ PRESETS
 // ============================================
 function showEQPresets() {
+    dbgEq('[showEQPresets] Fonksiyon çağrıldı');
+    
     if (window.aurivo?.presets?.openEQPresetsWindow) {
-        window.aurivo.presets.openEQPresetsWindow();
+        dbgEq('[showEQPresets] API bulundu, openEQPresetsWindow çağrılıyor...');
+        window.aurivo.presets.openEQPresetsWindow()
+            .then(result => dbgEq('[showEQPresets] Başarılı, sonuç:', result))
+            .catch(err => console.error('[showEQPresets] Hata:', err));
         return;
     }
+    console.error('[showEQPresets] HATA: presets API bulunamadı!');
     alert('Hazır Ayarlar penceresi açılamadı (presets API yok).');
 }
 
@@ -4267,12 +4425,23 @@ function normalize32Bands(bands) {
 }
 
 function applyEQPresetPayload(payload) {
+    dbgEq('[APPLY EQ PRESET] Fonksiyon çağrıldı, payload:', payload);
+    
     const preset = payload?.preset || payload;
     const filename = payload?.filename;
-    if (!preset) return;
+    if (!preset) {
+        console.error('[APPLY EQ PRESET] ✗ Preset bulunamadı!');
+        return;
+    }
 
     const bands = normalize32Bands(preset.bands);
     const presetName = preset.name || (filename ? filename.replace(/\.json$/i, '').replace(/_/g, ' ') : 'Hazır Ayar');
+
+    dbgEq('[APPLY EQ PRESET] Preset bilgisi:', {
+        name: presetName,
+        filename: filename,
+        bantSayısı: bands.length
+    });
 
     const settings = getSettings('eq32');
     settings.bands = bands;
@@ -4280,38 +4449,18 @@ function applyEQPresetPayload(payload) {
         filename: filename || null,
         name: presetName
     };
+
     saveSettings('eq32', settings);
 
-    // Uygulama ayarlarına da yaz (kapanıp açılınca aktif kalsın) - await et
-    (async () => {
-        try {
-            await persistEq32ToAppSettings(settings);
-            console.log('[EQ PRESET] Seçim kaydedildi:', presetName);
-        } catch (e) {
-            console.warn('[EQ PRESET] Kayıt hatası:', e);
-        }
-    })();
-
-    // UI: Slider değerleri
-    if (SFX.eqSliders && SFX.eqSliders.length > 0) {
-        for (let i = 0; i < 32; i++) {
-            const slider = SFX.eqSliders[i];
-            if (slider) slider.setValue(bands[i]);
-            const valueEl = document.getElementById(`eqValue${i}`);
-            if (valueEl) valueEl.textContent = `${bands[i].toFixed(1)}d`;
-        }
-    }
-
-    // UI: EQ curve
-    if (SFX.eqResponse) {
-        SFX.eqResponse.setBandValues(bands);
-    }
-
-    // Engine: uygula
+    // UI + Engine (tek sefer, event fırtınası olmadan)
+    updateEq32UIFromSettings(settings);
     applyEffect('eq32');
 
     // Buton etiketini kalıcı güncelle
     updateEqPresetButtonLabel();
+
+    // Kalıcı kayıt (preset seçimi kapanıp açılınca da görünsün)
+    schedulePersistEq32ToAppSettings(settings);
 
 }
 
@@ -4328,14 +4477,21 @@ function updateEqPresetButtonLabel() {
 }
 
 async function persistEq32ToAppSettings(eq32Settings) {
-    if (!window.aurivo?.loadSettings || !window.aurivo?.saveSettings) return;
+    dbgEq('[PERSIST EQ32] çağrıldı');
+
+    if (!window.aurivo?.loadSettings || !window.aurivo?.saveSettings) {
+        console.error('[PERSIST EQ32] ✗ aurivo.loadSettings veya saveSettings mevcut değil!');
+        return;
+    }
 
     const current = await window.aurivo.loadSettings();
+    dbgEq('[PERSIST EQ32] mevcut yüklendi');
+
     const next = { ...(current || {}) };
     next.sfx = { ...(current?.sfx || {}) };
     next.sfx.eq32 = { ...(current?.sfx?.eq32 || {}) };
 
-    next.sfx.eq32.bands = Array.isArray(eq32Settings?.bands) ? eq32Settings.bands : new Array(32).fill(0);
+    next.sfx.eq32.bands = normalize32Bands(eq32Settings?.bands);
     next.sfx.eq32.balance = Number.isFinite(eq32Settings?.balance) ? eq32Settings.balance : 0;
     next.sfx.eq32.bass = Number.isFinite(eq32Settings?.bass) ? eq32Settings.bass : 0;
     next.sfx.eq32.mid = Number.isFinite(eq32Settings?.mid) ? eq32Settings.mid : 0;
@@ -4343,19 +4499,25 @@ async function persistEq32ToAppSettings(eq32Settings) {
     next.sfx.eq32.stereoExpander = Number.isFinite(eq32Settings?.stereoExpander) ? eq32Settings.stereoExpander : 100;
     next.sfx.eq32.lastPreset = eq32Settings?.lastPreset || null;
 
-    await window.aurivo.saveSettings(next);
+    const result = await window.aurivo.saveSettings(next);
+    dbgEq('[PERSIST EQ32] ✓ Kayıt sonucu:', result);
+    
+    return result;
 }
 
 async function hydrateEq32FromAppSettings() {
     if (!window.aurivo?.loadSettings) return;
 
     try {
+        dbgEq('[EQ32 HYDRATE] Kayıtlı ayarlar yükleniyor...');
         const appSettings = await window.aurivo.loadSettings();
         const sfxEq32 = appSettings?.sfx?.eq32;
         if (!sfxEq32) {
-            console.log('[EQ32] Kayıtlı ayar yok, varsayılan kullanılacak');
+            dbgEq('[EQ32 HYDRATE] Kayıtlı ayar yok, varsayılan kullanılacak');
             return;
         }
+
+        dbgEq('[EQ32 HYDRATE] Ayarlar bulundu');
 
         const settings = getSettings('eq32');
         if (Array.isArray(sfxEq32.bands)) settings.bands = normalize32Bands(sfxEq32.bands);
@@ -4368,21 +4530,8 @@ async function hydrateEq32FromAppSettings() {
 
         saveSettings('eq32', settings);
 
-        const presetName = settings.lastPreset?.name || 'yok';
-        console.log('[EQ32] Kayıtlı ayarlar yüklendi:', presetName);
-
-        // UI'yı da güncelle (sliderlar/eğri)
-        if (SFX.eqSliders && SFX.eqSliders.length > 0 && Array.isArray(settings.bands)) {
-            for (let i = 0; i < 32; i++) {
-                const slider = SFX.eqSliders[i];
-                if (slider) slider.setValue(settings.bands[i]);
-                const valueEl = document.getElementById(`eqValue${i}`);
-                if (valueEl) valueEl.textContent = `${settings.bands[i].toFixed(1)}d`;
-            }
-        }
-        if (SFX.eqResponse && Array.isArray(settings.bands)) {
-            SFX.eqResponse.setBandValues(settings.bands);
-        }
+        updateEq32UIFromSettings(settings);
+        dbgEq('[EQ32 HYDRATE] ✓ Kayıtlı ayarlar yüklendi:', settings.lastPreset?.name || 'Düz (Flat)');
     } catch (e) {
         console.warn('[EQ32] Yükleme hatası:', e);
     }

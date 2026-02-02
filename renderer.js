@@ -25,6 +25,7 @@ const state = {
     isPlaying: false,
     isShuffle: false,
     isRepeat: false,
+    stopAfterCurrent: false, // System tray "Stop after current" özelliği
     volume: 40,
     isMuted: false,
     savedVolume: 40,
@@ -43,7 +44,22 @@ const state = {
     activePlayer: 'A', // 'A' veya 'B'
     // Native audio state
     nativePositionTimer: null,
-    nativePositionGeneration: 0
+    nativePositionGeneration: 0,
+    // MPRIS tracking
+    lastMPRISPosition: -1,
+    // Sekme bazlı konum hafızası
+    lastAudioPath: null, // Müzik sekmesi son konum
+    lastVideoPath: null, // Video sekmesi son konum
+    // Video state (müzikten tamamen ayrı)
+    videoFiles: [], // Mevcut klasördeki video dosyaları
+    currentVideoIndex: -1, // Oynatılan video indeksi
+    currentVideoPath: null, // Oynatılan video yolu
+    webTrackId: 0, // Web/YouTube için benzersiz track ID sayacı
+    webDuration: 0,
+    webPosition: 0,
+    webTitle: '',
+    webArtist: '',
+    webAlbum: ''
 };
 
 // Desteklenen ses formatları - BASS Audio Library destekli tüm formatlar
@@ -66,22 +82,39 @@ const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'wmv', 'm4v', 'flv
 // DOM Elements
 const elements = {};
 
+// Download UI State
+const downloadState = {
+    mode: 'video', // 'video' | 'audio'
+    activeId: null,
+    isRunning: false,
+    listenersInstalled: false,
+    logMaxChars: 18000
+};
+
 // ============================================
 // INITIALIZATION
 // ============================================
 document.addEventListener('DOMContentLoaded', async () => {
     cacheElements();
-    
+
+    // Player bar görünürlüğü kontrol et
+    const playerBar = document.getElementById('playerBar');
+    if (playerBar) {
+        playerBar.classList.remove('hidden');
+        playerBar.style.display = 'flex';
+        console.log('Player bar görünürlük kontrolü yapıldı');
+    }
+
     // C++ Audio Engine kontrolü
     await checkNativeAudio();
-    
+
     await loadSettings();
     await loadPlaylist();
     setupEventListeners();
     setupVisualizer();
     await initializeFileTree();
     initializeRainbowSliders();
-    
+
     console.log('Aurivo Player başlatıldı');
     if (useNativeAudio) {
         console.log('🎵 C++ BASS Audio Engine aktif');
@@ -96,21 +129,24 @@ async function checkNativeAudio() {
         if (window.aurivo && window.aurivo.audio) {
             const isAvailable = window.aurivo.audio.isNativeAvailable();
             console.log('Native Audio mevcut:', isAvailable);
-            
+
             if (isAvailable) {
                 // Audio Engine'i başlat
                 const initResult = await window.aurivo.audio.init();
                 console.log('Audio Engine init sonucu:', initResult);
-                
+
                 if (initResult && initResult.success) {
                     useNativeAudio = true;
                     console.log('✓ C++ Audio Engine başarıyla başlatıldı');
-                    
+
                     // AGC'yi kapat - ses bozukluğunu önlemek için
                     if (window.aurivo.audio.autoGain) {
                         window.aurivo.audio.autoGain.setEnabled(false);
                         console.log('AGC devre dışı bırakıldı');
                     }
+
+                    // ✨ EQ ayarlarını yükle ve uygula
+                    await loadAndApplyEQSettings();
                 } else {
                     useNativeAudio = false;
                     console.warn('C++ Audio Engine başlatılamadı:', initResult?.error);
@@ -125,47 +161,105 @@ async function checkNativeAudio() {
     }
 }
 
+// EQ ayarlarını yükle ve Audio Engine'e uygula
+async function loadAndApplyEQSettings() {
+    try {
+        if (!window.aurivo?.loadSettings || !window.aurivo?.ipcAudio?.eq) {
+            console.warn('[MAIN WINDOW] EQ yükleme atlandı (API yok)');
+            return;
+        }
+
+        console.log('[MAIN WINDOW] Kayıtlı EQ ayarları yükleniyor...');
+        const settings = await window.aurivo.loadSettings();
+        const eq32 = settings?.sfx?.eq32;
+
+        if (!eq32 || !Array.isArray(eq32.bands)) {
+            console.log('[MAIN WINDOW] Kayıtlı EQ yok, varsayılan kullanılıyor');
+            return;
+        }
+
+        console.log('[MAIN WINDOW] EQ ayarları bulundu:', {
+            preset: eq32.lastPreset?.name || 'Düz',
+            bantSayısı: eq32.bands.length
+        });
+
+        // EQ bantlarını Audio Engine'e uygula
+        eq32.bands.forEach((gain, index) => {
+            window.aurivo.ipcAudio.eq.setBand(index, gain);
+        });
+
+        // Aurivo Modülü (Bass, Mid, Treble, Stereo)
+        if (window.aurivo.ipcAudio.module) {
+            if (typeof eq32.bass === 'number') {
+                window.aurivo.ipcAudio.module.setBass(eq32.bass);
+            }
+            if (typeof eq32.mid === 'number') {
+                window.aurivo.ipcAudio.module.setMid(eq32.mid);
+            }
+            if (typeof eq32.treble === 'number') {
+                window.aurivo.ipcAudio.module.setTreble(eq32.treble);
+            }
+            if (typeof eq32.stereoExpander === 'number') {
+                window.aurivo.ipcAudio.module.setStereoExpander(eq32.stereoExpander);
+            }
+        }
+
+        // Balance
+        if (window.aurivo.ipcAudio.balance && typeof eq32.balance === 'number') {
+            window.aurivo.ipcAudio.balance.set(eq32.balance);
+        }
+
+        console.log('[MAIN WINDOW] ✓ EQ ayarları uygulandı:', eq32.lastPreset?.name || 'Düz');
+    } catch (err) {
+        console.error('[MAIN WINDOW] EQ yükleme hatası:', err);
+    }
+}
+
 function cacheElements() {
     // Sidebar
     elements.sidebarBtns = document.querySelectorAll('.sidebar-btn[data-page]');
     elements.settingsBtn = document.getElementById('settingsBtn');
+    elements.securityBtn = document.getElementById('securityBtn');
     elements.infoBtn = document.getElementById('infoBtn');
-    
+
     // Panels
     elements.leftPanel = document.getElementById('leftPanel');
     elements.libraryPanel = document.getElementById('libraryPanel');
     elements.webPanel = document.getElementById('webPanel');
-    
+
     // File Tree
     elements.fileTree = document.getElementById('fileTree');
-    
+
     // Cover
     elements.coverArt = document.getElementById('coverArt');
-    
+
     // Web Platforms
     elements.platformBtns = document.querySelectorAll('.platform-btn');
-    
+
     // Navigation
     elements.backBtn = document.getElementById('backBtn');
     elements.forwardBtn = document.getElementById('forwardBtn');
     elements.refreshBtn = document.getElementById('refreshBtn');
-    
+
     // Now Playing
     elements.nowPlayingLabel = document.getElementById('nowPlayingLabel');
-    
+
     // Pages
     elements.musicPage = document.getElementById('musicPage');
     elements.videoPage = document.getElementById('videoPage');
     elements.webPage = document.getElementById('webPage');
+    elements.downloadPage = document.getElementById('downloadPage');
+    elements.settingsPage = document.getElementById('settingsPage');
+    elements.securityPage = document.getElementById('securityPage');
     elements.pages = document.querySelectorAll('.page');
-    
+
     // Playlist
     elements.playlist = document.getElementById('playlist');
-    
+
     // Video & Web
     elements.videoPlayer = document.getElementById('videoPlayer');
     elements.webView = document.getElementById('webView');
-    
+
     // Player Controls
     elements.seekSlider = document.getElementById('seekSlider');
     elements.currentTime = document.getElementById('currentTime');
@@ -177,17 +271,17 @@ function cacheElements() {
     elements.nextBtn = document.getElementById('nextBtn');
     elements.shuffleBtn = document.getElementById('shuffleBtn');
     elements.repeatBtn = document.getElementById('repeatBtn');
+    elements.downloadBtn = document.getElementById('downloadBtn');
     elements.rewindBtn = document.getElementById('rewindBtn');
     elements.forwardSeekBtn = document.getElementById('forwardSeekBtn');
     elements.volumeBtn = document.getElementById('volumeBtn');
     elements.volumeSlider = document.getElementById('volumeSlider');
     elements.volumeLabel = document.getElementById('volumeLabel');
-    
+
     // Visualizer
     elements.visualizerCanvas = document.getElementById('visualizerCanvas');
-    
-    // Settings Modal
-    elements.settingsModal = document.getElementById('settingsModal');
+
+    // Settings (in-app page)
     elements.closeSettings = document.getElementById('closeSettings');
     elements.settingsTabs = document.querySelectorAll('.settings-tab');
     elements.settingsPages = document.querySelectorAll('.settings-page');
@@ -195,7 +289,93 @@ function cacheElements() {
     elements.settingsApply = document.getElementById('settingsApply');
     elements.settingsCancel = document.getElementById('settingsCancel');
     elements.resetPlayback = document.getElementById('resetPlayback');
-    
+
+    // Download Settings (Preferences modal)
+    elements.downloadPrefDirPath = document.getElementById('downloadPrefDirPath');
+    elements.downloadPrefSelectDir = document.getElementById('downloadPrefSelectDir');
+    elements.downloadPrefVideoQuality = document.getElementById('downloadPrefVideoQuality');
+    elements.downloadPrefVideoCodec = document.getElementById('downloadPrefVideoCodec');
+    elements.downloadPrefAudioFormat = document.getElementById('downloadPrefAudioFormat');
+    elements.downloadPrefAudioQuality = document.getElementById('downloadPrefAudioQuality');
+    elements.downloadPrefNormalizeAudio = document.getElementById('downloadPrefNormalizeAudio');
+    elements.downloadPrefCookiesBrowser = document.getElementById('downloadPrefCookiesBrowser');
+    elements.downloadPrefCookiesFile = document.getElementById('downloadPrefCookiesFile');
+    elements.downloadPrefSelectCookiesFile = document.getElementById('downloadPrefSelectCookiesFile');
+    elements.downloadPrefProxy = document.getElementById('downloadPrefProxy');
+    elements.downloadPrefUseConfig = document.getElementById('downloadPrefUseConfig');
+    elements.downloadPrefConfigRow = document.getElementById('downloadPrefConfigRow');
+    elements.downloadPrefConfigFile = document.getElementById('downloadPrefConfigFile');
+    elements.downloadPrefSelectConfigFile = document.getElementById('downloadPrefSelectConfigFile');
+    elements.downloadPrefShowMoreFormats = document.getElementById('downloadPrefShowMoreFormats');
+    elements.downloadPrefFormatOverrideRow = document.getElementById('downloadPrefFormatOverrideRow');
+    elements.downloadPrefFormatOverride = document.getElementById('downloadPrefFormatOverride');
+    elements.downloadPrefPlaylist = document.getElementById('downloadPrefPlaylist');
+    elements.downloadPrefPlaylistFormats = document.getElementById('downloadPrefPlaylistFormats');
+    elements.downloadPrefPlaylistFilenameFormat = document.getElementById('downloadPrefPlaylistFilenameFormat');
+    elements.downloadPrefPlaylistFoldernameFormat = document.getElementById('downloadPrefPlaylistFoldernameFormat');
+    elements.downloadPrefCustomArgs = document.getElementById('downloadPrefCustomArgs');
+
+    // Download (in-app page)
+    elements.closeDownload = document.getElementById('closeDownload');
+    elements.downloadTabVideo = document.getElementById('downloadTabVideo');
+    elements.downloadTabAudio = document.getElementById('downloadTabAudio');
+    elements.downloadViewTitle = document.getElementById('downloadViewTitle');
+    elements.downloadViewBackBtn = document.getElementById('downloadViewBackBtn');
+    elements.downloadPageBasic = document.getElementById('downloadPageBasic');
+    elements.downloadPageAdvanced = document.getElementById('downloadPageAdvanced');
+    elements.downloadTitle = document.getElementById('downloadTitle');
+    elements.downloadCardModeTitle = document.getElementById('downloadCardModeTitle');
+    elements.downloadMoreBtn = document.getElementById('downloadMoreBtn');
+    elements.downloadUrl = document.getElementById('downloadUrl');
+    elements.downloadPasteUrl = document.getElementById('downloadPasteUrl');
+    elements.downloadFolder = document.getElementById('downloadFolder');
+    elements.downloadBrowseFolder = document.getElementById('downloadBrowseFolder');
+    elements.downloadVideoCodecRow = document.getElementById('downloadVideoCodecRow');
+    elements.downloadVideoCodec = document.getElementById('downloadVideoCodec');
+    elements.downloadCookiesBrowser = document.getElementById('downloadCookiesBrowser');
+    elements.downloadCookiesFile = document.getElementById('downloadCookiesFile');
+    elements.downloadBrowseCookiesFile = document.getElementById('downloadBrowseCookiesFile');
+    elements.downloadProxy = document.getElementById('downloadProxy');
+    elements.downloadUseConfig = document.getElementById('downloadUseConfig');
+    elements.downloadConfigRow = document.getElementById('downloadConfigRow');
+    elements.downloadConfigFile = document.getElementById('downloadConfigFile');
+    elements.downloadBrowseConfigFile = document.getElementById('downloadBrowseConfigFile');
+    elements.downloadShowMoreFormats = document.getElementById('downloadShowMoreFormats');
+    elements.downloadFormatOverride = document.getElementById('downloadFormatOverride');
+    elements.downloadPlaylist = document.getElementById('downloadPlaylist');
+    elements.downloadPlaylistFormats = document.getElementById('downloadPlaylistFormats');
+    elements.downloadPlaylistFilenameFormat = document.getElementById('downloadPlaylistFilenameFormat');
+    elements.downloadPlaylistFoldernameFormat = document.getElementById('downloadPlaylistFoldernameFormat');
+    elements.downloadCustomArgs = document.getElementById('downloadCustomArgs');
+    elements.downloadOptionsVideo = document.getElementById('downloadOptionsVideo');
+    elements.downloadOptionsAudio = document.getElementById('downloadOptionsAudio');
+    elements.downloadVideoQuality = document.getElementById('downloadVideoQuality');
+    elements.downloadAudioFormat = document.getElementById('downloadAudioFormat');
+    elements.downloadAudioQuality = document.getElementById('downloadAudioQuality');
+    elements.downloadNormalizeAudio = document.getElementById('downloadNormalizeAudio');
+    elements.downloadProgressBox = document.getElementById('downloadProgressBox');
+    elements.downloadProgressLabel = document.getElementById('downloadProgressLabel');
+    elements.downloadProgressPercent = document.getElementById('downloadProgressPercent');
+    elements.downloadProgressFill = document.getElementById('downloadProgressFill');
+    elements.downloadDetailsBtn = document.getElementById('downloadDetailsBtn');
+    elements.downloadDetails = document.getElementById('downloadDetails');
+    elements.downloadCancelActiveBtn = document.getElementById('downloadCancelActiveBtn');
+    elements.downloadCancelBtn = document.getElementById('downloadCancelBtn');
+    elements.downloadStartBtn = document.getElementById('downloadStartBtn');
+    elements.downloadStopBtn = document.getElementById('downloadStopBtn');
+
+    // Security (in-app page)
+    elements.closeSecurity = document.getElementById('closeSecurity');
+    elements.securityConnStatus = document.getElementById('securityConnStatus');
+    elements.securityCurrentUrl = document.getElementById('securityCurrentUrl');
+    elements.securityAllowPopups = document.getElementById('securityAllowPopups');
+    elements.securityCopyUrlBtn = document.getElementById('securityCopyUrlBtn');
+    elements.securityOpenInBrowserBtn = document.getElementById('securityOpenInBrowserBtn');
+    elements.securityClearCookiesBtn = document.getElementById('securityClearCookiesBtn');
+    elements.securityClearCacheBtn = document.getElementById('securityClearCacheBtn');
+    elements.securityClearAllBtn = document.getElementById('securityClearAllBtn');
+    elements.securityResetWebBtn = document.getElementById('securityResetWebBtn');
+
     // Audio Elements (İki adet - crossfade için)
     elements.audioA = new Audio();
     elements.audioA.preload = 'metadata';
@@ -205,21 +385,83 @@ function cacheElements() {
     elements.audio = elements.audioA;
 }
 
+function isPageVisible(pageEl) {
+    return Boolean(pageEl && !pageEl.classList.contains('hidden'));
+}
+
+function showUtilityPage(pageEl, btnEl) {
+    if (!pageEl) return;
+    pageEl.classList.remove('hidden');
+    pageEl.classList.add('active');
+    if (btnEl) btnEl.classList.add('active');
+}
+
+function hideUtilityPage(pageEl, btnEl) {
+    if (!pageEl) return;
+    pageEl.classList.add('hidden');
+    pageEl.classList.remove('active');
+    if (btnEl) btnEl.classList.remove('active');
+}
+
+function closeAllUtilityPages() {
+    // Download uses special close logic (hide when running)
+    try { closeDownloadModal(false); } catch { }
+    hideUtilityPage(elements.settingsPage, elements.settingsBtn);
+    hideUtilityPage(elements.securityPage, elements.securityBtn);
+}
+
 // ============================================
 // SETTINGS
 // ============================================
 async function loadSettings() {
     if (window.aurivo) {
         state.settings = await window.aurivo.loadSettings();
+        if (!state.settings) state.settings = {};
         state.volume = state.settings.volume || 40;
         state.isShuffle = state.settings.shuffle || false;
         state.isRepeat = state.settings.repeat || false;
-        
+
+        // Defaults for playback settings (if missing)
+        if (!state.settings.playback) {
+            state.settings.playback = {
+                crossfadeStopEnabled: true,
+                crossfadeManualEnabled: true,
+                crossfadeAutoEnabled: false,
+                sameAlbumNoCrossfade: true,
+                crossfadeMs: 2000,
+                fadeOnPauseResume: false,
+                pauseFadeMs: 250
+            };
+        }
+
+        // Defaults for download settings (ytDownloader-style)
+        if (!state.settings.download) {
+            state.settings.download = {
+                downloadDir: '',
+                preferredVideoQuality: 'auto',
+                preferredVideoCodec: '',
+                preferredAudioFormat: 'mp3',
+                preferredAudioQuality: '192',
+                normalizeAudio: true,
+                cookiesFromBrowser: '',
+                cookiesFile: '',
+                proxy: '',
+                useConfig: false,
+                configFile: '',
+                showMoreFormats: false,
+                formatOverride: '',
+                playlist: false,
+                playlistFilenameFormat: '%(playlist_index)s.%(title)s.%(ext)s',
+                playlistFoldernameFormat: '%(playlist_title)s',
+                customArgs: ''
+            };
+        }
+
         // UI'ı güncelle
         elements.volumeSlider.value = state.volume;
         elements.volumeLabel.textContent = state.volume + '%';
         elements.audio.volume = state.volume / 100;
-        
+
         if (state.isShuffle) elements.shuffleBtn.classList.add('active');
         if (state.isRepeat) elements.repeatBtn.classList.add('active');
     }
@@ -242,15 +484,16 @@ function setupEventListeners() {
     elements.sidebarBtns.forEach(btn => {
         btn.addEventListener('click', () => handleSidebarClick(btn));
     });
-    
-    elements.settingsBtn.addEventListener('click', openSettings);
-    elements.infoBtn.addEventListener('click', showAbout);
-    
+
+    if (elements.settingsBtn) elements.settingsBtn.addEventListener('click', openSettings);
+    if (elements.securityBtn) elements.securityBtn.addEventListener('click', openSecurity);
+    if (elements.infoBtn) elements.infoBtn.addEventListener('click', showAbout);
+
     // Web Platforms
     elements.platformBtns.forEach(btn => {
         btn.addEventListener('click', () => handlePlatformClick(btn));
     });
-    
+
     // FILE TREE - Event Delegation (ÖNEMLİ!)
     if (elements.fileTree) {
         elements.fileTree.addEventListener('click', handleFileTreeClick);
@@ -261,18 +504,18 @@ function setupEventListeners() {
     // Global fallback: click'leri yakala (DOM değişiminde kaybolmasın)
     document.addEventListener('click', handleFileTreeClickGlobal, true);
     document.addEventListener('dblclick', handleFileTreeDblClickGlobal, true);
-    
+
     // Folder context menu dışına tıklanınca kapat
     document.addEventListener('click', () => {
         const menu = document.getElementById('folderContextMenu');
         if (menu) menu.classList.add('hidden');
     });
-    
+
     // Navigation
     elements.backBtn.addEventListener('click', navigateBack);
     elements.forwardBtn.addEventListener('click', navigateForward);
     elements.refreshBtn.addEventListener('click', refreshCurrentView);
-    
+
     // Player Controls
     elements.playPauseBtn.addEventListener('click', togglePlayPause);
     elements.prevBtn.addEventListener('click', () => playPreviousWithCrossfade());
@@ -281,6 +524,14 @@ function setupEventListeners() {
     elements.repeatBtn.addEventListener('click', toggleRepeat);
     elements.rewindBtn.addEventListener('click', () => seekBy(-10));
     elements.forwardSeekBtn.addEventListener('click', () => seekBy(10));
+
+    // Download
+    if (elements.downloadBtn) {
+        elements.downloadBtn.addEventListener('click', openDownloadModal);
+    }
+
+    // Download settings (Preferences modal)
+    setupDownloadPreferencesEvents();
 
     // Visualizer (projectM)
     const visualizerBtn = document.getElementById('visualizer-btn');
@@ -293,73 +544,638 @@ function setupEventListeners() {
             }
         });
     }
-    
+
     // Volume
     elements.volumeBtn.addEventListener('click', toggleMute);
     elements.volumeSlider.addEventListener('input', handleVolumeChange);
-    
+
     // Seek - tek tıkla pozisyon ayarlama
     elements.seekSlider.addEventListener('input', handleSeek);
     elements.seekSlider.addEventListener('click', handleSeekClick);
-    
+
     // Volume slider - tek tıkla ayarlama
     elements.volumeSlider.addEventListener('click', handleVolumeClick);
-    
+
     // Volume slider - tekerlek ile ayarlama (5 kademeli)
     elements.volumeSlider.addEventListener('wheel', handleVolumeWheel);
-    
+
     // Audio Events - Her iki player için de event listener ekle
     setupAudioPlayerEvents(elements.audioA, 'A');
     setupAudioPlayerEvents(elements.audioB, 'B');
-    
-    // Settings Modal
-    elements.closeSettings.addEventListener('click', closeSettings);
-    elements.settingsCancel.addEventListener('click', closeSettings);
-    elements.settingsOk.addEventListener('click', () => { applySettings(); closeSettings(); });
-    elements.settingsApply.addEventListener('click', applySettings);
-    
-    elements.settingsTabs.forEach(tab => {
-        tab.addEventListener('click', () => switchSettingsTab(tab));
-    });
-    
-    elements.resetPlayback.addEventListener('click', resetPlaybackDefaults);
-    
+
+    // Video Player Events
+    setupVideoPlayerEvents();
+
+    // Video kontrol butonları
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+    const videoMenuBtn = document.getElementById('videoMenuBtn');
+
+    if (fullscreenBtn) {
+        fullscreenBtn.addEventListener('click', toggleVideoFullscreen);
+    }
+
+    if (videoMenuBtn) {
+        videoMenuBtn.addEventListener('click', showVideoMenu);
+    }
+
+    // Video player çift tıklama - tam ekran
+    if (elements.videoPlayer) {
+        elements.videoPlayer.addEventListener('dblclick', toggleVideoFullscreen);
+    }
+
+    // TAM EKRAN VIDEO KONTROL PANELİ - Event Listeners
+    setupFullscreenVideoControls();
+
+    // Settings (in-app page)
+    if (elements.closeSettings) elements.closeSettings.addEventListener('click', closeSettings);
+    if (elements.settingsCancel) elements.settingsCancel.addEventListener('click', closeSettings);
+    if (elements.settingsOk) elements.settingsOk.addEventListener('click', () => { applySettings(); closeSettings(); });
+    if (elements.settingsApply) elements.settingsApply.addEventListener('click', applySettings);
+
+    if (elements.settingsTabs && elements.settingsTabs.length) {
+        elements.settingsTabs.forEach(tab => {
+            tab.addEventListener('click', () => switchSettingsTab(tab));
+        });
+    }
+
+    if (elements.resetPlayback) elements.resetPlayback.addEventListener('click', resetPlaybackDefaults);
+
     // Crossfade Auto checkbox dependency
     const crossfadeAuto = document.getElementById('crossfadeAuto');
     const sameAlbumNo = document.getElementById('sameAlbumNoCrossfade');
-    crossfadeAuto.addEventListener('change', () => {
-        sameAlbumNo.disabled = !crossfadeAuto.checked;
-    });
-    
+    if (crossfadeAuto && sameAlbumNo) {
+        crossfadeAuto.addEventListener('change', () => {
+            sameAlbumNo.disabled = !crossfadeAuto.checked;
+        });
+    }
+
     // Keyboard Shortcuts
     document.addEventListener('keydown', handleKeyboard);
-    
+
     // Drag & Drop - geliştirilmiş
     setupDragAndDrop();
+
+    // Download UI
+    setupDownloadModalEvents();
+    setupDownloadIPC();
+
+    // Security UI
+    setupSecurityUI();
+
+    // WebView Navigation Events (YouTube track change detection)
+    if (elements.webView) {
+        elements.webView.addEventListener('did-navigate', handleWebNavigation);
+        elements.webView.addEventListener('did-navigate-in-page', handleWebNavigation);
+
+        // Web Sync Listener (YouTube olaylarını yakala)
+        elements.webView.addEventListener('console-message', (e) => {
+            if (e.message.startsWith('AURIVO_SYNC:')) {
+                try {
+                    const data = JSON.parse(e.message.replace('AURIVO_SYNC:', ''));
+                    handleWebSync(data);
+                } catch (err) { console.error('Sync parse error', err); }
+            }
+        });
+
+        // Çift Müzik Simgesi Çözümü: WebView içindeki MediaSession API'yi devre dışı bırak
+        // Böylece YouTube/Spotify vb. kendi MPRIS/MediaSession kontrolünü oluşturamaz.
+        // Sadece Aurivo'nun ana süreçteki (main process) MPRIS servisi aktif kalır.
+        elements.webView.addEventListener('dom-ready', () => {
+            elements.webView.executeJavaScript(`
+                try {
+                    if (window.navigator) {
+                        // Dummy MediaSession with metadata interception
+                        const dummySession = {
+                            playbackState: "none",
+                            setActionHandler: function() {},
+                            setPositionState: function() {}
+                        };
+                        
+                        let _metadata = null;
+                        Object.defineProperty(dummySession, 'metadata', {
+                            get: function() { return _metadata; },
+                            set: function(val) {
+                                _metadata = val;
+                                if (val) {
+                                    let artworkUrl = "";
+                                    if (val.artwork && val.artwork.length > 0) {
+                                        artworkUrl = val.artwork[val.artwork.length - 1].src;
+                                    }
+                                    const data = { type: 'metadata', title: val.title, artist: val.artist, album: val.album, artwork: artworkUrl };
+                                    console.log('AURIVO_SYNC:' + JSON.stringify(data));
+                                }
+                            }
+                        });
+
+                        Object.defineProperty(window.navigator, "mediaSession", {
+                            value: dummySession,
+                            writable: false, configurable: false
+                        });
+                    }
+                    
+                    // Aurivo Sync Script: YouTube olaylarını dinle ve ana sürece ilet
+                    (function() {
+                        let lastMedia = null;
+                        function attachEvents(media) {
+                            if (lastMedia === media) return;
+                            lastMedia = media;
+                            const sendUpdate = (type) => {
+                                const data = { type: type, currentTime: media.currentTime, duration: media.duration, paused: media.paused };
+                                console.log('AURIVO_SYNC:' + JSON.stringify(data));
+                            };
+                            media.addEventListener('play', () => sendUpdate('play'));
+                            media.addEventListener('pause', () => sendUpdate('pause'));
+                            media.addEventListener('seeked', () => sendUpdate('seeked'));
+                            media.addEventListener('durationchange', () => sendUpdate('durationchange'));
+                            media.addEventListener('loadeddata', () => sendUpdate('loadeddata'));
+                        }
+                        const observer = new MutationObserver(() => {
+                            const media = document.querySelector('video, audio');
+                            if (media) attachEvents(media);
+                        });
+                        observer.observe(document.body, { childList: true, subtree: true });
+                        const media = document.querySelector('video, audio');
+                        if (media) attachEvents(media);
+                    })();
+                } catch(e) { console.error("MediaSession disable error:", e); }
+            `);
+        });
+    }
+
+    // System Tray Media Control Listener
+    setupSystemTrayControl();
+}
+
+function getWebViewUrlSafe() {
+    try {
+        return String(elements.webView?.getURL?.() || '').trim() || 'about:blank';
+    } catch {
+        return 'about:blank';
+    }
+}
+
+function updateSecurityUI() {
+    const url = getWebViewUrlSafe();
+    const isHttps = url.startsWith('https://');
+    const isHttp = url.startsWith('http://');
+
+    if (elements.securityCurrentUrl) elements.securityCurrentUrl.textContent = `URL: ${url}`;
+    if (elements.securityConnStatus) {
+        if (isHttps) elements.securityConnStatus.textContent = 'Bağlantı: Güvenli (HTTPS)';
+        else if (isHttp) elements.securityConnStatus.textContent = 'Bağlantı: Güvensiz (HTTP)';
+        else elements.securityConnStatus.textContent = 'Bağlantı: -';
+    }
+
+    if (elements.securityAllowPopups && elements.webView) {
+        const has = elements.webView.hasAttribute('allowpopups');
+        elements.securityAllowPopups.checked = has;
+    }
+}
+
+function openSecurity() {
+    if (!elements.securityPage) return;
+    closeDownloadModal(false);
+    hideUtilityPage(elements.settingsPage, elements.settingsBtn);
+    showUtilityPage(elements.securityPage, elements.securityBtn);
+    updateSecurityUI();
+}
+
+function closeSecurity() {
+    hideUtilityPage(elements.securityPage, elements.securityBtn);
+}
+
+function setupSecurityUI() {
+    if (!elements.securityPage) return;
+
+    if (elements.closeSecurity) elements.closeSecurity.addEventListener('click', closeSecurity);
+
+    if (elements.securityAllowPopups && elements.webView) {
+        elements.securityAllowPopups.addEventListener('change', () => {
+            if (!elements.webView) return;
+            if (elements.securityAllowPopups.checked) {
+                elements.webView.setAttribute('allowpopups', '');
+            } else {
+                elements.webView.removeAttribute('allowpopups');
+            }
+        });
+    }
+
+    if (elements.securityCopyUrlBtn) {
+        elements.securityCopyUrlBtn.addEventListener('click', async () => {
+            const url = getWebViewUrlSafe();
+            try {
+                window.aurivo?.clipboard?.setText?.(url);
+                safeNotify('URL kopyalandı.', 'success');
+            } catch (e) {
+                safeNotify('URL kopyalanamadı: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.securityOpenInBrowserBtn) {
+        elements.securityOpenInBrowserBtn.addEventListener('click', async () => {
+            const url = getWebViewUrlSafe();
+            try {
+                const ok = await window.aurivo?.webSecurity?.openExternal?.(url);
+                if (!ok) safeNotify('Tarayıcıda açılamadı.', 'error');
+            } catch (e) {
+                safeNotify('Tarayıcıda açılamadı: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    const clear = async (opts, okMsg) => {
+        try {
+            const ok = await window.aurivo?.webSecurity?.clearData?.(opts);
+            if (!ok) {
+                safeNotify('Temizleme başarısız.', 'error');
+                return;
+            }
+            safeNotify(okMsg, 'success');
+            updateSecurityUI();
+        } catch (e) {
+            safeNotify('Temizleme hatası: ' + (e?.message || e), 'error');
+        }
+    };
+
+    if (elements.securityClearCookiesBtn) {
+        elements.securityClearCookiesBtn.addEventListener('click', () => clear({ cookies: true }, 'Çerezler temizlendi.'));
+    }
+    if (elements.securityClearCacheBtn) {
+        elements.securityClearCacheBtn.addEventListener('click', () => clear({ cache: true }, 'Önbellek temizlendi.'));
+    }
+    if (elements.securityClearAllBtn) {
+        elements.securityClearAllBtn.addEventListener('click', () => clear({ all: true }, 'Web verileri temizlendi.'));
+    }
+    if (elements.securityResetWebBtn) {
+        elements.securityResetWebBtn.addEventListener('click', () => {
+            try {
+                elements.webView?.loadURL?.('about:blank');
+                safeNotify('Web sıfırlandı.', 'success');
+                updateSecurityUI();
+            } catch (e) {
+                safeNotify('Web sıfırlanamadı: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+}
+
+function setupDownloadPreferencesEvents() {
+    const sync = () => {
+        if (elements.downloadPrefConfigRow && elements.downloadPrefUseConfig) {
+            elements.downloadPrefConfigRow.classList.toggle('hidden', !elements.downloadPrefUseConfig.checked);
+        }
+        if (elements.downloadPrefFormatOverrideRow && elements.downloadPrefShowMoreFormats) {
+            elements.downloadPrefFormatOverrideRow.classList.toggle('hidden', !elements.downloadPrefShowMoreFormats.checked);
+        }
+        if (elements.downloadPrefPlaylistFormats && elements.downloadPrefPlaylist) {
+            elements.downloadPrefPlaylistFormats.classList.toggle('hidden', !elements.downloadPrefPlaylist.checked);
+        }
+    };
+
+    if (elements.downloadPrefUseConfig) elements.downloadPrefUseConfig.addEventListener('change', sync);
+    if (elements.downloadPrefShowMoreFormats) elements.downloadPrefShowMoreFormats.addEventListener('change', sync);
+    if (elements.downloadPrefPlaylist) elements.downloadPrefPlaylist.addEventListener('change', sync);
+    sync();
+
+    if (elements.downloadPrefSelectDir) {
+        elements.downloadPrefSelectDir.addEventListener('click', async () => {
+            try {
+                const current = state?.settings?.download?.downloadDir || '';
+                const res = await window.aurivo?.dialog?.openFolder?.({
+                    title: 'İndirme dizinini seç',
+                    defaultPath: current || undefined
+                });
+                if (res?.path) {
+                    state.settings.download.downloadDir = res.path;
+                    if (elements.downloadPrefDirPath) elements.downloadPrefDirPath.textContent = res.path;
+                    await saveSettings();
+                }
+            } catch (e) {
+                safeNotify('İndirme dizini seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadPrefSelectCookiesFile) {
+        elements.downloadPrefSelectCookiesFile.addEventListener('click', async () => {
+            try {
+                const res = await window.aurivo?.openFile?.();
+                const fp = Array.isArray(res) ? res[0] : null;
+                if (fp && elements.downloadPrefCookiesFile) elements.downloadPrefCookiesFile.value = fp;
+            } catch (e) {
+                safeNotify('Cookies dosyası seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadPrefSelectConfigFile) {
+        elements.downloadPrefSelectConfigFile.addEventListener('click', async () => {
+            try {
+                const res = await window.aurivo?.openFile?.();
+                const fp = Array.isArray(res) ? res[0] : null;
+                if (fp && elements.downloadPrefConfigFile) elements.downloadPrefConfigFile.value = fp;
+            } catch (e) {
+                safeNotify('Config dosyası seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+}
+
+// ============================================
+// SYSTEM TRAY MEDIA CONTROL
+// ============================================
+function setupSystemTrayControl() {
+    if (!window.aurivo || !window.aurivo.onMediaControl) {
+        console.warn('System tray API yok');
+        return;
+    }
+
+    // Main process'ten gelen media control komutlarını dinle
+    window.aurivo.onMediaControl((action) => {
+        console.log('System tray media control:', action);
+
+        switch (action) {
+            case 'play-pause':
+                togglePlayPause();
+                break;
+            case 'stop':
+                stopAudio();
+                state.isPlaying = false;
+                updatePlayPauseIcon(false);
+                break;
+            case 'previous':
+                playPreviousWithCrossfade();
+                break;
+            case 'next':
+                playNextWithCrossfade();
+                break;
+            case 'mute-toggle':
+                toggleMute();
+                break;
+            case 'stop-after-current':
+                state.stopAfterCurrent = !state.stopAfterCurrent;
+                console.log('Stop after current:', state.stopAfterCurrent);
+                updateTrayState(); // Tray menüsünü güncelle
+                break;
+            case 'like':
+                // TODO: Beğen özelliği (favorilere ekle/çıkar)
+                console.log('Like feature not implemented yet');
+                break;
+        }
+
+        // Her media control'den sonra tray durumunu güncelle
+        updateTrayState();
+    });
+
+    // MPRIS seek event (ortam oynatıcıdan süre çubuğu sürükleme)
+    if (window.aurivo.onMPRISSeek) {
+        window.aurivo.onMPRISSeek(async (offsetMicroseconds) => {
+            console.log('MPRIS seek offset (relative):', offsetMicroseconds);
+            const offsetSeconds = offsetMicroseconds / 1000000;
+
+            // Mevcut pozisyonu al ve offset ekle
+            if (useNativeAudio && window.aurivo?.audio) {
+                try {
+                    const currentPos = await window.aurivo.audio.getPosition(); // ms
+                    const newPos = currentPos + (offsetSeconds * 1000); // ms
+                    await window.aurivo.audio.seek(Math.max(0, newPos));
+                    console.log('Seeked to:', newPos / 1000, 'seconds');
+                } catch (e) {
+                    console.error('Seek error:', e);
+                }
+            } else if (state.activeMedia === 'web' && elements.webView) {
+                // Web/YouTube Relative Seek
+                try {
+                    elements.webView.executeJavaScript(`
+                        var v = document.querySelector('video, audio');
+                        if (v) v.currentTime += ${offsetSeconds};
+                    `);
+                } catch (e) { console.warn('Web seek error:', e); }
+            } else {
+                seekBy(offsetSeconds);
+            }
+        });
+    }
+
+    // MPRIS position event (ortam oynatıcıdan pozisyon değişikliği - MUTLAK pozisyon)
+    if (window.aurivo.onMPRISPosition) {
+        window.aurivo.onMPRISPosition(async (positionMicroseconds) => {
+            const positionSeconds = positionMicroseconds / 1000000;
+            console.log('MPRIS SetPosition (absolute):', positionSeconds, 'seconds');
+
+            if (useNativeAudio && window.aurivo?.audio) {
+                try {
+                    await window.aurivo.audio.seek(positionSeconds * 1000); // saniye -> milisaniye
+                    console.log('Position set to:', positionSeconds, 'seconds');
+                } catch (e) {
+                    console.error('SetPosition error:', e);
+                }
+            } else if (state.activeMedia === 'web' && elements.webView) {
+                // Web/YouTube Absolute Seek
+                try {
+                    const pos = Number(positionSeconds);
+                    if (!isNaN(pos)) {
+                        elements.webView.executeJavaScript(`
+                            var v = document.querySelector('video, audio');
+                            if (v) v.currentTime = ${pos};
+                        `);
+                        // Arayüzü anında güncelle (gecikmeyi önlemek için)
+                        state.webPosition = pos;
+                        updateMPRISMetadata();
+                    }
+                } catch (e) { console.warn('Web position error:', e); }
+            } else {
+                const activePlayer = getActiveAudioPlayer();
+                activePlayer.currentTime = positionSeconds;
+            }
+        });
+    }
+
+    console.log('System tray media control listener kuruldu');
+}
+
+// System tray'e güncel playback state gönder
+function updateTrayState() {
+    if (!window.aurivo || !window.aurivo.updateTrayState) return;
+
+    const currentTrack = state.playlist[state.currentIndex];
+    const trackName = currentTrack ? (currentTrack.title || currentTrack.name || 'Bilinmeyen Parça') : 'Parça Yok';
+
+    window.aurivo.updateTrayState({
+        isPlaying: state.isPlaying,
+        isMuted: state.isMuted,
+        stopAfterCurrent: state.stopAfterCurrent,
+        currentTrack: trackName
+    });
+}
+
+// Web/YouTube navigasyonunda MPRIS'i sıfırla
+function handleWebNavigation() {
+    if (state.activeMedia === 'web') {
+        console.log('[WEB] Navigation detected, resetting MPRIS position');
+        state.webTrackId++; // Yeni bir ID atayarak sistemin "yeni parça" algılamasını sağla
+        state.webPosition = 0;
+        state.webDuration = 0;
+        state.webTitle = '';
+        state.webArtist = '';
+        state.webAlbum = '';
+        // Metadata güncellemesi ile süreyi 0'a çek
+        updateMPRISMetadata();
+    }
+
+    // Security page is URL-aware
+    if (isPageVisible(elements.securityPage)) {
+        updateSecurityUI();
+    }
+}
+
+// MPRIS'e metadata gönder (Linux ortam oynatıcısı)
+async function updateMPRISMetadata() {
+    if (!window.aurivo || !window.aurivo.updateMPRISMetadata) return;
+
+    // Duration ve position al
+    let duration = 0;
+    let position = 0;
+    let title = 'Bilinmeyen';
+    let artist = 'Bilinmeyen Sanatçı';
+    let album = '';
+    let trackId = state.currentIndex;
+
+    if (state.activeMedia === 'video') {
+        // Video için metadata
+        const video = elements.videoPlayer;
+        if (video && video.src) {
+            duration = video.duration || 0; // saniye
+            position = video.currentTime || 0; // saniye
+
+            // Video dosya adından başlık çıkar
+            const fileName = video.src.split('/').pop().split('#')[0].split('?')[0];
+            title = decodeURIComponent(fileName).replace(/\.[^/.]+$/, '');
+            artist = 'Video';
+        }
+    } else if (state.activeMedia === 'audio') {
+        // Audio için metadata
+        const currentTrack = state.playlist[state.currentIndex];
+        if (!currentTrack) return;
+
+        // Dosya adından metadata çıkar
+        const fileName = currentTrack.name || '';
+        title = currentTrack.title || fileName.replace(/\.[^/.]+$/, ''); // Uzantıyı kaldır
+        artist = currentTrack.artist || 'Bilinmeyen Sanatçı';
+        album = currentTrack.album || '';
+
+        // Eğer title yoksa dosya adından parse et
+        if (!currentTrack.title && fileName.includes(' - ')) {
+            const parts = fileName.split(' - ');
+            if (parts.length >= 2) {
+                artist = parts[0].trim();
+                title = parts[1].replace(/\.[^/.]+$/, '').trim();
+            }
+        }
+
+        if (useNativeAudio && window.aurivo?.audio) {
+            try {
+                // getDuration saniye döndürüyor, getPosition milisaniye
+                duration = await window.aurivo.audio.getDuration(); // saniye
+                position = (await window.aurivo.audio.getPosition()) / 1000; // ms -> saniye
+            } catch (e) {
+                // Ignore
+            }
+        } else {
+            const activePlayer = getActiveAudioPlayer();
+            duration = activePlayer.duration || 0; // saniye
+            position = activePlayer.currentTime || 0; // saniye
+        }
+    } else if (state.activeMedia === 'web') {
+        title = state.webTitle || elements.nowPlayingLabel.textContent.replace('Şu An Çalınan: ', '') || 'Web Medya';
+        artist = state.webArtist || 'Aurivo Web';
+        album = state.webAlbum || 'Online';
+        trackId = `web_${state.webTrackId}`; // FIX: Hyphen replaced with underscore for safer DBus path
+        duration = state.webDuration || 0;
+        position = state.webPosition || 0;
+    }
+
+    window.aurivo.updateMPRISMetadata({
+        trackId: trackId,
+        title: title,
+        artist: artist,
+        album: album,
+        albumArt: state.currentCover || '',
+        duration: duration,
+        position: position,
+        isPlaying: state.isPlaying
+    });
+}
+
+// Web/YouTube senkronizasyon işleyicisi
+function handleWebSync(data) {
+    if (state.activeMedia !== 'web') return;
+
+    if (data.type === 'metadata') {
+        state.webTitle = data.title || '';
+        state.webArtist = data.artist || '';
+        state.webAlbum = data.album || '';
+
+        if (state.webTitle) elements.nowPlayingLabel.textContent = 'Şu An Çalınan: ' + state.webTitle;
+        if (data.artwork) updateCoverArt(data.artwork, 'web');
+
+        updateTrayState();
+        updateMPRISMetadata();
+        return;
+    }
+
+    state.webPosition = data.currentTime || 0;
+    state.webDuration = data.duration || 0;
+
+    if (data.type === 'play') {
+        state.isPlaying = true;
+        updatePlayPauseIcon(true);
+        updateTrayState();
+        updateMPRISMetadata();
+    } else if (data.type === 'pause') {
+        state.isPlaying = false;
+        updatePlayPauseIcon(false);
+        updateTrayState();
+        updateMPRISMetadata();
+    } else if (data.type === 'seeked' || data.type === 'durationchange' || data.type === 'loadeddata') {
+        updateMPRISMetadata();
+    }
+
+    // UI Güncelleme (Süre ve Slider)
+    if (elements.currentTime && elements.durationTime) {
+        elements.currentTime.textContent = formatTime(state.webPosition);
+        elements.durationTime.textContent = formatTime(state.webDuration);
+    }
+    if (elements.seekSlider && state.webDuration > 0) {
+        const progress = (state.webPosition / state.webDuration) * 1000;
+        elements.seekSlider.value = progress;
+        updateRainbowSlider(elements.seekSlider, progress / 10);
+    }
 }
 
 function setupDragAndDrop() {
     const dropZone = elements.playlist;
-    
+
     // Prevent default drag behaviors
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
         dropZone.addEventListener(eventName, preventDefaults, false);
         document.body.addEventListener(eventName, preventDefaults, false);
     });
-    
+
     // Highlight drop zone when item is dragged over
     ['dragenter', 'dragover'].forEach(eventName => {
         dropZone.addEventListener(eventName, () => {
             dropZone.classList.add('drag-over');
         }, false);
     });
-    
+
     ['dragleave', 'drop'].forEach(eventName => {
         dropZone.addEventListener(eventName, () => {
             dropZone.classList.remove('drag-over');
         }, false);
     });
-    
+
     // Handle dropped files - hem harici dosyalardan hem de file tree'den
     dropZone.addEventListener('drop', handleFileDrop, false);
 }
@@ -368,13 +1184,13 @@ function setupDragAndDrop() {
 function handleTreeItemDragStart(e) {
     // Seçili tüm dosyaları al
     const selectedItems = document.querySelectorAll('.tree-item.file.selected');
-    
+
     // Eğer sürüklenen öğe seçili değilse, sadece onu seç
     if (!e.target.closest('.tree-item').classList.contains('selected')) {
         document.querySelectorAll('.tree-item.file').forEach(i => i.classList.remove('selected'));
         e.target.closest('.tree-item').classList.add('selected');
     }
-    
+
     // Seçili dosya yollarını JSON olarak aktar
     const filePaths = [];
     document.querySelectorAll('.tree-item.file.selected').forEach(item => {
@@ -383,10 +1199,10 @@ function handleTreeItemDragStart(e) {
             name: item.dataset.name
         });
     });
-    
+
     e.dataTransfer.setData('text/aurivo-files', JSON.stringify(filePaths));
     e.dataTransfer.effectAllowed = 'copy';
-    
+
     // Sürükleme görselini ayarla
     e.target.closest('.tree-item').classList.add('dragging');
 }
@@ -409,7 +1225,7 @@ function setupAudioPlayerEvents(player, playerId) {
     player.addEventListener('timeupdate', () => {
         // Native audio kullanıyorken HTML5 audio event'lerini tamamen devre dışı bırak
         if (useNativeAudio) return;
-        
+
         // Sadece aktif player için güncelle
         if (getActiveAudioPlayer() === player) {
             updateTimeDisplay();
@@ -417,45 +1233,997 @@ function setupAudioPlayerEvents(player, playerId) {
             maybeStartAutoCrossfade();
         }
     });
-    
+
     // Metadata yüklendiğinde
     player.addEventListener('loadedmetadata', () => {
         // Native audio kullanıyorken HTML5 audio event'lerini tamamen devre dışı bırak
         if (useNativeAudio) return;
-        
+
         if (getActiveAudioPlayer() === player) {
             handleMetadataLoaded();
         }
     });
-    
+
     // Parça bittiğinde
     player.addEventListener('ended', () => {
         // Native audio kullanıyorken HTML5 audio event'lerini tamamen devre dışı bırak
         if (useNativeAudio) return;
-        
+
         if (getActiveAudioPlayer() === player) {
             handleTrackEnded();
         }
     });
-    
+
     // Play/Pause durumu
     player.addEventListener('play', () => {
         // Native audio kullanıyorken HTML5 audio event'lerini tamamen devre dışı bırak
         if (useNativeAudio) return;
-        
+
         if (getActiveAudioPlayer() === player) {
             updatePlayPauseIcon(true);
         }
     });
-    
+
     player.addEventListener('pause', () => {
         // Native audio kullanıyorken HTML5 audio event'lerini tamamen devre dışı bırak
         if (useNativeAudio) return;
-        
+
         if (getActiveAudioPlayer() === player) {
             updatePlayPauseIcon(false);
         }
     });
+}
+
+// Video Player Event Listeners
+function setupVideoPlayerEvents() {
+    const video = elements.videoPlayer;
+    if (!video) return;
+
+    // Zaman güncelleme
+    video.addEventListener('timeupdate', () => {
+        if (state.activeMedia === 'video') {
+            updateTimeDisplay();
+
+            // MPRIS position'ı throttle et (her 2 saniyede bir)
+            const currentSecInt = Math.floor(video.currentTime || 0);
+            if (currentSecInt !== state.lastMPRISPosition && currentSecInt % 2 === 0) {
+                state.lastMPRISPosition = currentSecInt;
+                updateMPRISMetadata();
+            }
+        }
+    });
+
+    // Metadata yüklendiğinde
+    video.addEventListener('loadedmetadata', () => {
+        if (state.activeMedia === 'video') {
+            updateTimeDisplay();
+            updateMPRISMetadata();
+        }
+    });
+
+    // Video bittiğinde
+    video.addEventListener('ended', () => {
+        if (state.activeMedia === 'video') {
+            state.isPlaying = false;
+            updatePlayPauseIcon(false);
+            updateTrayState();
+            updateMPRISMetadata();
+
+            // Sıradaki videoyu çal (kütüphaneden)
+            playNextVideo();
+        }
+    });
+
+    // Play/Pause durumu
+    video.addEventListener('play', () => {
+        if (state.activeMedia === 'video') {
+            state.isPlaying = true;
+            updatePlayPauseIcon(true);
+            updateTrayState();
+            updateMPRISMetadata();
+        }
+    });
+
+    video.addEventListener('pause', () => {
+        if (state.activeMedia === 'video') {
+            state.isPlaying = false;
+            updatePlayPauseIcon(false);
+            updateTrayState();
+            updateMPRISMetadata();
+        }
+    });
+}
+
+// Video tam ekran toggle
+function toggleVideoFullscreen() {
+    const videoPage = document.getElementById('videoPage');
+
+    if (!document.fullscreenElement) {
+        // Tam ekrana geç
+        if (videoPage.requestFullscreen) {
+            videoPage.requestFullscreen();
+        } else if (videoPage.webkitRequestFullscreen) {
+            videoPage.webkitRequestFullscreen();
+        } else if (videoPage.mozRequestFullScreen) {
+            videoPage.mozRequestFullScreen();
+        }
+    } else {
+        // Tam ekrandan çık
+        if (document.exitFullscreen) {
+            document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+        } else if (document.mozCancelFullScreen) {
+            document.mozCancelFullScreen();
+        }
+    }
+}
+
+// ============================================
+// TAM EKRAN VIDEO KONTROL PANELİ
+// Python uygulamasından uyarlandı
+// ============================================
+
+// Tam ekran kontrol state
+const fsControlState = {
+    hideTimer: null,
+    hideDelay: 3000, // 3 saniye
+    isVisible: true,
+    currentSpeed: 1.0,
+    currentFps: 0, // 0 = Auto
+    seeking: false,
+    currentBrightness: 1.0,
+    isMenuOpen: false
+};
+
+const fsHudState = {
+    volumeTimer: null,
+    brightnessTimer: null
+};
+
+let fsSettingsCaptureBound = false;
+
+const fsMenuPortalMap = new WeakMap();
+
+function portalizeFsMenu(menuEl) {
+    // Portal devre dışı - menüler videoFsControls içinde kalacak
+    // Bu video overlay plane sorunlarını önler
+    console.log('🔧 [DEBUG] portalizeFsMenu devre dışı - menü içeride kalıyor:', menuEl?.id);
+    return;
+}
+
+function syncFsMenuOpenState() {
+    const anyOpen =
+        !document.getElementById('fsSettingsMenu')?.classList.contains('hidden') ||
+        !document.getElementById('fsQualityMenu')?.classList.contains('hidden') ||
+        !document.getElementById('fsSpeedMenu')?.classList.contains('hidden');
+    fsControlState.isMenuOpen = !!anyOpen;
+}
+
+function isVideoFullscreenActive() {
+    const videoPage = document.getElementById('videoPage');
+    if (!videoPage) return false;
+
+    const activeEl =
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.mozFullScreenElement;
+
+    // Bazı sistemlerde fullscreen video elementinde/child node'da açılabiliyor.
+    // Bu durumda da video sayfası fullscreen kabul edilsin.
+    return !!activeEl && (activeEl === videoPage || videoPage.contains(activeEl));
+}
+
+function isFsSettingsButtonHit(e, pad = 10) {
+    const btn = document.getElementById('fsSettingsBtn');
+    if (!btn) return false;
+    if (e?.target?.closest?.('#fsSettingsBtn')) return true;
+
+    const rect = btn.getBoundingClientRect();
+    if (typeof e?.clientX !== 'number' || typeof e?.clientY !== 'number') return false;
+    return (
+        e.clientX >= (rect.left - pad) && e.clientX <= (rect.right + pad) &&
+        e.clientY >= (rect.top - pad) && e.clientY <= (rect.bottom + pad)
+    );
+}
+
+function ensureFsWheelHud() {
+    const videoPage = document.getElementById('videoPage');
+    if (!videoPage) return;
+
+    if (!document.getElementById('fsVolumeWheelHud')) {
+        const el = document.createElement('div');
+        el.id = 'fsVolumeWheelHud';
+        el.className = 'fs-wheel-hud left hidden';
+        el.innerHTML = `
+            <span class="material-symbols-rounded fs-wheel-hud-icon" aria-hidden="true">volume_up</span>
+            <span class="fs-wheel-hud-value" id="fsVolumeWheelHudValue">0%</span>
+            <div class="fs-wheel-hud-bar" aria-hidden="true"><div class="fs-wheel-hud-bar-fill" id="fsVolumeWheelHudFill"></div></div>
+        `;
+        videoPage.appendChild(el);
+    }
+
+    if (!document.getElementById('fsBrightnessWheelHud')) {
+        const el = document.createElement('div');
+        el.id = 'fsBrightnessWheelHud';
+        el.className = 'fs-wheel-hud right hidden';
+        el.innerHTML = `
+            <span class="material-symbols-rounded fs-wheel-hud-icon" aria-hidden="true">brightness_6</span>
+            <span class="fs-wheel-hud-value" id="fsBrightnessWheelHudValue">100%</span>
+            <div class="fs-wheel-hud-bar" aria-hidden="true"><div class="fs-wheel-hud-bar-fill" id="fsBrightnessWheelHudFill"></div></div>
+        `;
+        videoPage.appendChild(el);
+    }
+}
+
+function showFsWheelHud(type, percent) {
+    const safePercent = clampNumber(Math.round(percent), 0, 999);
+
+    if (type === 'volume') {
+        const hud = document.getElementById('fsVolumeWheelHud');
+        const value = document.getElementById('fsVolumeWheelHudValue');
+        const fill = document.getElementById('fsVolumeWheelHudFill');
+        const icon = hud?.querySelector('.fs-wheel-hud-icon');
+        if (!hud || !value) return;
+        value.textContent = `${safePercent}%`;
+        if (icon) icon.textContent = safePercent === 0 ? 'volume_off' : (safePercent <= 50 ? 'volume_down' : 'volume_up');
+        if (fill) fill.style.height = `${clampNumber(safePercent, 0, 100)}%`;
+        hud.classList.remove('hidden');
+        if (fsHudState.volumeTimer) clearTimeout(fsHudState.volumeTimer);
+        fsHudState.volumeTimer = setTimeout(() => hud.classList.add('hidden'), 900);
+        return;
+    }
+
+    if (type === 'brightness') {
+        const hud = document.getElementById('fsBrightnessWheelHud');
+        const value = document.getElementById('fsBrightnessWheelHudValue');
+        const fill = document.getElementById('fsBrightnessWheelHudFill');
+        if (!hud || !value) return;
+        value.textContent = `${safePercent}%`;
+        // Parlaklık aralığı: 35% - 200% => fill'i 0-100 aralığına normalize et
+        if (fill) {
+            const normalized = ((safePercent - 35) / (200 - 35)) * 100;
+            fill.style.height = `${clampNumber(normalized, 0, 100)}%`;
+        }
+        hud.classList.remove('hidden');
+        if (fsHudState.brightnessTimer) clearTimeout(fsHudState.brightnessTimer);
+        fsHudState.brightnessTimer = setTimeout(() => hud.classList.add('hidden'), 900);
+    }
+}
+
+function setFsMenuVisible(menuEl, visible) {
+    if (!menuEl) {
+        console.error('❌ [DEBUG] setFsMenuVisible: menuEl null!');
+        return;
+    }
+
+    console.log('🔧 [DEBUG] setFsMenuVisible çağrıldı:', menuEl.id, 'visible:', visible);
+
+    if (visible) {
+        // Sadece hidden class'ını kaldır - CSS halleder
+        menuEl.classList.remove('hidden');
+
+        // Kesinlikle göster
+        menuEl.style.removeProperty('display');
+        menuEl.style.removeProperty('visibility');
+        menuEl.style.removeProperty('opacity');
+
+        console.log('✅ [DEBUG] Menü açıldı:', {
+            id: menuEl.id,
+            hidden: menuEl.classList.contains('hidden'),
+            parent: menuEl.parentElement?.id,
+            rect: menuEl.getBoundingClientRect(),
+            computedDisplay: window.getComputedStyle(menuEl).display,
+            computedVisibility: window.getComputedStyle(menuEl).visibility,
+            computedOpacity: window.getComputedStyle(menuEl).opacity,
+            computedZIndex: window.getComputedStyle(menuEl).zIndex
+        });
+        syncFsMenuOpenState();
+        return;
+    }
+
+    // Kapat
+    menuEl.classList.add('hidden');
+    console.log('🔧 [DEBUG] Menü kapatıldı:', menuEl.id);
+    syncFsMenuOpenState();
+}
+
+function setupFullscreenVideoControls() {
+    const videoPage = document.getElementById('videoPage');
+    const fsControls = document.getElementById('videoFsControls');
+    const video = elements.videoPlayer;
+
+    if (!videoPage || !fsControls || !video) return;
+
+    // HUD'ları hazırla (ses/parlaklık yüzdesi)
+    ensureFsWheelHud();
+
+    // Ayarlar butonunu capture-phase'de yakala (başka handler'lar yutmasın)
+    if (!fsSettingsCaptureBound) {
+        const handler = (e) => {
+            console.log('🔧 [DEBUG] Capture-phase handler tetiklendi:', {
+                type: e.type,
+                target: e.target?.id || e.target?.className,
+                fullscreen: isVideoFullscreenActive(),
+                buttonHit: isFsSettingsButtonHit(e)
+            });
+            if (!isVideoFullscreenActive()) return;
+            if (isFsSettingsButtonHit(e)) {
+                console.log('✅ [DEBUG] Settings button HIT! handleFsSettingsClick çağrılıyor');
+                // Bubble-phase click-outside handler menüyü anında kapatmasın
+                e?.preventDefault?.();
+                e?.stopPropagation?.();
+                e?.stopImmediatePropagation?.();
+                handleFsSettingsClick(e);
+            }
+        };
+
+        // Sadece click kullan - pointerdown/mousedown kaldırıldı
+        document.addEventListener('click', handler, true);
+        fsSettingsCaptureBound = true;
+    }
+
+    // Fullscreen change event listener
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+    document.addEventListener('mozfullscreenchange', handleFullscreenChange);
+
+    // Mouse movement - SADECE VIDEO SAYFASINDA
+    videoPage.addEventListener('mousemove', handleVideoMouseMove);
+
+    // Sol/sağ kenarda mouse tekerleği ile ses/parlaklık
+    // (passive:false gerekli, yoksa preventDefault çalışmaz)
+    videoPage.addEventListener('wheel', handleFullscreenWheel, { passive: false });
+
+    // MOUSE BAR ÜZERİNDE - Timer'ı durdur (kaybolmasın)
+    fsControls.addEventListener('mouseenter', () => {
+        if (isVideoFullscreenActive()) {
+            stopFsHideTimer();
+        }
+    });
+
+    // MOUSE BAR'DAN ÇIKTI - Timer'ı başlat (kaybolsun)
+    fsControls.addEventListener('mouseleave', () => {
+        if (isVideoFullscreenActive()) {
+            startFsHideTimer();
+        }
+    });
+
+    // Seek slider
+    const fsSeekSlider = document.getElementById('fsSeekSlider');
+    fsSeekSlider.addEventListener('input', handleFsSeekInput);
+    fsSeekSlider.addEventListener('change', handleFsSeekChange);
+
+    // Play/Pause
+    document.getElementById('fsPlayBtn').addEventListener('click', handleFsPlayPause);
+
+    // Prev/Next Video
+    document.getElementById('fsPrevBtn').addEventListener('click', () => playPreviousVideo());
+    document.getElementById('fsNextBtn').addEventListener('click', () => playNextVideo());
+
+    // ±10 saniye
+    document.getElementById('fsBack10Btn').addEventListener('click', () => seekVideoRelative(-10));
+    document.getElementById('fsFwd10Btn').addEventListener('click', () => seekVideoRelative(10));
+
+    // Ses kontrolü
+    document.getElementById('fsMuteBtn').addEventListener('click', handleFsMute);
+    document.getElementById('fsVolumeSlider').addEventListener('input', handleFsVolumeChange);
+
+    // Hız
+    document.getElementById('fsSpeedBtn').addEventListener('click', handleFsSpeedClick);
+
+    // FPS
+    document.getElementById('fsFpsBtn').addEventListener('click', handleFsFpsClick);
+
+    // Ayarlar (event delegation: DOM değişse bile çalışsın)
+    videoPage.addEventListener('click', (e) => {
+        if (!isVideoFullscreenActive()) return;
+        if (e.target?.closest('#fsSettingsBtn')) {
+            handleFsSettingsClick(e);
+        }
+    });
+
+    // Ayarlar menüsü item'ları (YouTube tarzı)
+    document.querySelectorAll('#fsSettingsMenu .yt-settings-item.dropdown-item').forEach(item => {
+        item.addEventListener('click', (e) => {
+            const setting = e.currentTarget?.dataset?.setting;
+            if (setting === 'quality') {
+                setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+                const qm = document.getElementById('fsQualityMenu');
+                setFsMenuVisible(qm, true);
+                anchorFullscreenMenu(qm);
+                showFsControls();
+                stopFsHideTimer();
+                syncFsMenuOpenState();
+            } else if (setting === 'playback-speed') {
+                setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+                const sm = document.getElementById('fsSpeedMenu');
+                setFsMenuVisible(sm, true);
+                anchorFullscreenMenu(sm);
+                showFsControls();
+                stopFsHideTimer();
+                syncFsMenuOpenState();
+            }
+        });
+    });
+
+    // Geri butonları
+    document.querySelectorAll('.yt-back-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const target = e.currentTarget.dataset.back;
+            if (target === 'main') {
+                setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+                setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+                const menu = document.getElementById('fsSettingsMenu');
+                setFsMenuVisible(menu, true);
+                anchorFullscreenMenu(menu);
+                showFsControls();
+                stopFsHideTimer();
+                syncFsMenuOpenState();
+            }
+        });
+    });
+
+    // Kalite seçimi
+    document.querySelectorAll('#fsQualityMenu [data-quality]').forEach(item => {
+        item.addEventListener('click', (e) => {
+            const quality = e.currentTarget.dataset.quality;
+            document.querySelectorAll('#fsQualityMenu [data-quality]').forEach(i => i.classList.remove('active'));
+            e.currentTarget.classList.add('active');
+            document.getElementById('currentQuality').textContent =
+                quality === 'auto' ? 'Otomatik (1080p)' : quality;
+            // Menüyü kapat
+            setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+            syncFsMenuOpenState();
+        });
+    });
+
+    // Oynatma hızı seçimi
+    document.querySelectorAll('#fsSpeedMenu [data-speed]').forEach(item => {
+        item.addEventListener('click', (e) => {
+            const speed = parseFloat(e.currentTarget.dataset.speed);
+            document.querySelectorAll('#fsSpeedMenu [data-speed]').forEach(i => i.classList.remove('active'));
+            e.currentTarget.classList.add('active');
+            elements.videoPlayer.playbackRate = speed;
+            fsControlState.currentSpeed = speed;
+            document.getElementById('currentPlaybackSpeed').textContent =
+                speed === 1 ? 'Normal' : speed.toString();
+
+            const speedBtn = document.getElementById('fsSpeedBtn');
+            if (speedBtn) speedBtn.textContent = speed.toFixed(1) + 'x';
+            // Menüyü kapat
+            setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+            syncFsMenuOpenState();
+        });
+    });
+
+    // Menü dışına tıklayınca kapat
+    document.addEventListener('click', (e) => {
+        // Settings butonuna tıklandıysa, o zaten toggle yapıyor - burada dokunma
+        if (isFsSettingsButtonHit(e)) {
+            console.log('🔧 [DEBUG] Click-outside: Settings butonuna tıklandı, skip');
+            return;
+        }
+
+        const insideAnyMenu =
+            !!e.target.closest('#fsSettingsMenu') ||
+            !!e.target.closest('#fsQualityMenu') ||
+            !!e.target.closest('#fsSpeedMenu');
+
+        if (!insideAnyMenu) {
+            console.log('🔧 [DEBUG] Click-outside: Menüleri kapatıyor');
+            setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+            setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+            setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+            syncFsMenuOpenState();
+        }
+    });
+
+    // Tam ekrandan çık
+    document.getElementById('fsExitBtn').addEventListener('click', exitVideoFullscreen);
+
+    // Video timeupdate - progress bar güncelle
+    video.addEventListener('timeupdate', updateFsProgressBar);
+
+    // Video loadedmetadata - toplam süreyi güncelle
+    video.addEventListener('loadedmetadata', updateFsTotalTime);
+}
+
+function handleFullscreenChange() {
+    const videoPage = document.getElementById('videoPage');
+    const fsControls = document.getElementById('videoFsControls');
+
+    if (isVideoFullscreenActive()) {
+        // Tam ekrana girdi
+        videoPage?.classList.add('fs-active');
+        fsControlState.isVisible = true;
+        showFsControls();
+        startFsHideTimer();
+
+        // Linux/Wayland/X11'de bazı durumlarda video overlay plane üstte kalabiliyor.
+        // Video'ya sürekli filter uygulamak overlay kullanımını azaltır ve UI'ın görünmesini sağlar.
+        if (elements.videoPlayer) {
+            elements.videoPlayer.style.filter = `brightness(${fsControlState.currentBrightness.toFixed(3)})`;
+        }
+
+        // Menüleri kapat / state sıfırla
+        setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+        setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+        setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+        syncFsMenuOpenState();
+
+        // Sync initial state
+        updateFsControlsState();
+    } else {
+        // Tam ekrandan çıktı
+        videoPage?.classList.remove('fs-active');
+        stopFsHideTimer();
+
+        setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+        setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+        setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+        syncFsMenuOpenState();
+    }
+}
+
+function handleVideoMouseMove(e) {
+    if (!isVideoFullscreenActive()) return;
+
+    // Menü açıkken auto-hide yapma
+    if (fsControlState.isMenuOpen) {
+        showFsControls();
+        stopFsHideTimer();
+        const videoPage = document.getElementById('videoPage');
+        videoPage?.classList.remove('hide-cursor');
+        return;
+    }
+
+    // Bar veya menü üzerindeyken: sabit kalsın, timer yeniden başlamasın
+    const fsControls = document.getElementById('videoFsControls');
+    if (fsControls && (fsControls.matches(':hover') || e.target?.closest('#videoFsControls'))) {
+        showFsControls();
+        stopFsHideTimer();
+        const videoPage = document.getElementById('videoPage');
+        videoPage?.classList.remove('hide-cursor');
+        return;
+    }
+
+    // Mouse hareket edince kontrolleri göster
+    showFsControls();
+    startFsHideTimer();
+
+    // Cursor'ı göster
+    const videoPage = document.getElementById('videoPage');
+    videoPage.classList.remove('hide-cursor');
+}
+
+function showFsControls() {
+    const fsControls = document.getElementById('videoFsControls');
+    if (!fsControls) return;
+
+    fsControls.classList.remove('hidden');
+    fsControlState.isVisible = true;
+
+    const videoPage = document.getElementById('videoPage');
+    videoPage?.classList.remove('hide-cursor');
+}
+
+function hideFsControls() {
+    const fsControls = document.getElementById('videoFsControls');
+    if (!fsControls) return;
+
+    fsControls.classList.add('hidden');
+    fsControlState.isVisible = false;
+
+    // Cursor'ı da gizle
+    const videoPage = document.getElementById('videoPage');
+    if (videoPage) {
+        videoPage.classList.add('hide-cursor');
+    }
+}
+
+function startFsHideTimer() {
+    stopFsHideTimer();
+    if (fsControlState.isMenuOpen) return;
+    // Bar veya menü üzerindeyken asla başlatma
+    const fsControls = document.getElementById('videoFsControls');
+    if (fsControls && fsControls.matches(':hover')) return;
+    fsControlState.hideTimer = setTimeout(() => {
+        hideFsControls();
+    }, fsControlState.hideDelay);
+}
+
+function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function anchorFullscreenMenu(menuEl) {
+    if (!menuEl) return;
+    console.log('🔧 [DEBUG] anchorFullscreenMenu çağrıldı:', menuEl.id);
+
+    // CSS'de zaten position: absolute; bottom: 60px; right: 20px; var
+    // Inline override'ları temizle, CSS'e bırak
+    menuEl.style.removeProperty('position');
+    menuEl.style.removeProperty('bottom');
+    menuEl.style.removeProperty('right');
+    menuEl.style.removeProperty('top');
+    menuEl.style.removeProperty('left');
+
+    console.log('✅ [DEBUG] Menü anchor temizlendi, CSS yönetiyor:', {
+        parent: menuEl.parentElement?.id,
+        rect: menuEl.getBoundingClientRect()
+    });
+}
+
+function handleFullscreenWheel(e) {
+    if (!isVideoFullscreenActive()) return;
+    // Trackpad pinch/zoom veya ctrl+wheel gibi durumları dokunma
+    if (e.ctrlKey) return;
+
+    const videoPage = document.getElementById('videoPage');
+    if (!videoPage) return;
+
+    const edgePx = 90; // Soldaki/kaydaki hassas bölge genişliği
+    const x = e.clientX;
+    const vw = document.documentElement.clientWidth;
+
+    const inLeft = x <= edgePx;
+    const inRight = x >= (vw - edgePx);
+
+    if (!inLeft && !inRight) return;
+
+    // Scroll'u engelle
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Bar görünür kalsın
+    showFsControls();
+    stopFsHideTimer();
+
+    const direction = e.deltaY > 0 ? -1 : 1; // wheel up -> increase
+
+    if (inLeft) {
+        // Ses +/-
+        const step = 5;
+        const slider = elements.volumeSlider;
+        if (!slider) return;
+        const current = parseInt(slider.value || '0', 10);
+        const next = clampNumber(current + direction * step, 0, 100);
+        slider.value = String(next);
+        handleVolumeChange();
+
+        // 0'a inince mute gibi davran
+        if (next === 0) {
+            state.isMuted = true;
+            if (elements.videoPlayer) elements.videoPlayer.muted = true;
+            if (elements.audio) elements.audio.muted = true;
+            updateVolumeIcon();
+            updateFsVolumeIcon();
+        }
+
+        const fsVol = document.getElementById('fsVolumeSlider');
+        const fsLbl = document.getElementById('fsVolumeLabel');
+        if (fsVol) fsVol.value = String(next);
+        if (fsLbl) fsLbl.textContent = `${next}%`;
+        updateFsVolumeIcon();
+
+        showFsWheelHud('volume', next);
+    } else if (inRight) {
+        // Parlaklık +/- (video filter)
+        const step = 0.07;
+        const next = clampNumber(fsControlState.currentBrightness + direction * step, 0.35, 2.0);
+        fsControlState.currentBrightness = next;
+        if (elements.videoPlayer) {
+            elements.videoPlayer.style.filter = `brightness(${next.toFixed(3)})`;
+        }
+
+        showFsWheelHud('brightness', next * 100);
+    }
+}
+
+function stopFsHideTimer() {
+    if (fsControlState.hideTimer) {
+        clearTimeout(fsControlState.hideTimer);
+        fsControlState.hideTimer = null;
+    }
+}
+
+function handleFsSeekInput(e) {
+    fsControlState.seeking = true;
+    const video = elements.videoPlayer;
+    const value = parseInt(e.target.value);
+    const duration = video.duration || 0;
+    const time = (value / 1000) * duration;
+
+    // Sadece label'ı güncelle, video pozisyonunu değil
+    const label = document.getElementById('fsTimeCurrentLabel');
+    if (label) {
+        label.textContent = formatTime(time);
+    }
+
+    // Rainbow slider efektini güncelle
+    const percent = (value / e.target.max) * 100;
+    updateRainbowSlider(e.target, percent);
+}
+
+function handleFsSeekChange(e) {
+    const video = elements.videoPlayer;
+    const value = parseInt(e.target.value);
+    const duration = video.duration || 0;
+    const time = (value / 1000) * duration;
+
+    video.currentTime = time;
+    fsControlState.seeking = false;
+}
+
+function handleFsPlayPause() {
+    const video = elements.videoPlayer;
+
+    if (video.paused) {
+        video.play();
+    } else {
+        video.pause();
+    }
+}
+
+function seekVideoRelative(seconds) {
+    const video = elements.videoPlayer;
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + seconds));
+}
+
+function handleFsMute() {
+    // toggleMute fonksiyonunu kullan - tüm kontroller senkronize olur
+    toggleMute();
+    updateFsControlsState();
+}
+
+function handleFsVolumeChange(e) {
+    const video = elements.videoPlayer;
+    const value = parseInt(e.target.value);
+
+    video.volume = value / 100;
+    video.muted = false;
+
+    // State güncelle
+    state.volume = value;
+    state.isMuted = false;
+
+    // Ana arayüz kontrollerini senkronize et
+    if (elements.volumeSlider) {
+        elements.volumeSlider.value = value;
+        updateRainbowSlider(elements.volumeSlider, value);
+    }
+    if (elements.volumeLabel) {
+        elements.volumeLabel.textContent = value + '%';
+    }
+
+    // Tam ekran label güncelle
+    const label = document.getElementById('fsVolumeLabel');
+    if (label) {
+        label.textContent = value + '%';
+    }
+
+    // Tam ekran slider rainbow efekti
+    updateRainbowSlider(e.target, value);
+
+    // Fullscreen ses ikonunu güncelle
+    updateFsVolumeIcon();
+
+    updateVolumeIcon();
+    updateFsControlsState();
+    saveSettings();
+}
+
+// Fullscreen ses ikonu (YouTube tarzı Material Symbols)
+function updateFsVolumeIcon() {
+    const muteBtn = document.getElementById('fsMuteBtn');
+    const iconSpan = document.getElementById('fsYouTubeVolumeIcon');
+    if (!muteBtn || !iconSpan) return;
+
+    const video = elements.videoPlayer;
+    const volumePercent = Math.round((video?.volume || 0) * 100);
+    const isMuted = !!video?.muted || state.isMuted || volumePercent === 0;
+
+    // CSS değişkenini ayarla (akıcı animasyon için)
+    const volumeRatio = isMuted ? 0 : (volumePercent / 100);
+    muteBtn.style.setProperty('--fs-volume', volumeRatio.toString());
+    muteBtn.classList.toggle('is-muted', isMuted);
+
+    // İkon tipi (YouTube benzeri)
+    if (isMuted || volumePercent === 0) {
+        iconSpan.textContent = 'volume_off';
+    } else if (volumePercent <= 50) {
+        iconSpan.textContent = 'volume_down';
+    } else {
+        iconSpan.textContent = 'volume_up';
+    }
+}
+
+function handleFsSpeedClick() {
+    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    const currentIndex = speeds.indexOf(fsControlState.currentSpeed);
+    const nextIndex = (currentIndex + 1) % speeds.length;
+    const newSpeed = speeds[nextIndex];
+
+    fsControlState.currentSpeed = newSpeed;
+    elements.videoPlayer.playbackRate = newSpeed;
+
+    // Butonu güncelle
+    const btn = document.getElementById('fsSpeedBtn');
+    if (btn) {
+        btn.textContent = newSpeed.toFixed(1) + 'x';
+    }
+}
+
+function handleFsFpsClick() {
+    const fpsOptions = [0, 24, 30, 60]; // 0 = Auto
+    const currentIndex = fpsOptions.indexOf(fsControlState.currentFps);
+    const nextIndex = (currentIndex + 1) % fpsOptions.length;
+    const newFps = fpsOptions[nextIndex];
+
+    fsControlState.currentFps = newFps;
+
+    // Butonu güncelle
+    const btn = document.getElementById('fsFpsBtn');
+    if (btn) {
+        btn.textContent = newFps === 0 ? 'Auto' : newFps.toString();
+    }
+
+    // FPS ayarını uygula (video rendering için - şimdilik sadece UI)
+    console.log('FPS ayarlandı:', newFps === 0 ? 'Auto' : newFps);
+}
+
+function handleFsSettingsClick(e) {
+    console.log('🔧 [DEBUG] handleFsSettingsClick ÇAĞRILDI', { target: e?.target, fullscreen: isVideoFullscreenActive() });
+
+    // Bazı global click handler'lar menüyü anında kapatabiliyor; burada kesiyoruz.
+    e?.preventDefault?.();
+    e?.stopPropagation?.();
+
+    // YouTube tarzı ayarlar menüsünü aç/kapat
+    const menu = document.getElementById('fsSettingsMenu');
+    console.log('🔧 [DEBUG] Menü elementi:', menu, 'Hidden:', menu?.classList.contains('hidden'));
+    if (!menu) {
+        console.error('❌ [DEBUG] fsSettingsMenu bulunamadı!');
+        return;
+    }
+
+    const isHidden = menu.classList.contains('hidden');
+
+    // Tüm menüleri kapat
+    setFsMenuVisible(document.getElementById('fsSettingsMenu'), false);
+    setFsMenuVisible(document.getElementById('fsQualityMenu'), false);
+    setFsMenuVisible(document.getElementById('fsSpeedMenu'), false);
+
+    if (isHidden) {
+        setFsMenuVisible(menu, true);
+        anchorFullscreenMenu(menu);
+        showFsControls();
+        stopFsHideTimer();
+        syncFsMenuOpenState();
+    }
+}
+
+function exitVideoFullscreen() {
+    if (document.exitFullscreen) {
+        document.exitFullscreen();
+    } else if (document.webkitExitFullscreen) {
+        document.webkitExitFullscreen();
+    } else if (document.mozCancelFullScreen) {
+        document.mozCancelFullScreen();
+    }
+}
+
+function updateFsProgressBar() {
+    if (fsControlState.seeking) return;
+
+    const video = elements.videoPlayer;
+    const slider = document.getElementById('fsSeekSlider');
+    const currentLabel = document.getElementById('fsTimeCurrentLabel');
+
+    if (!slider || !currentLabel) return;
+
+    const duration = video.duration || 0;
+    const currentTime = video.currentTime || 0;
+
+    if (duration > 0) {
+        const value = (currentTime / duration) * 1000;
+        slider.value = value;
+    }
+
+    currentLabel.textContent = formatTime(currentTime);
+}
+
+function updateFsTotalTime() {
+    const video = elements.videoPlayer;
+    const totalLabel = document.getElementById('fsTimeTotalLabel');
+
+    if (!totalLabel) return;
+
+    const duration = video.duration || 0;
+    totalLabel.textContent = formatTime(duration);
+}
+
+function updateFsControlsState() {
+    const video = elements.videoPlayer;
+
+    // Play/Pause ikon - hidden class kullan
+    const playIcon = document.getElementById('fsPlayIcon');
+    const pauseIcon = document.getElementById('fsPauseIcon');
+
+    if (playIcon && pauseIcon) {
+        if (video.paused) {
+            playIcon.classList.remove('hidden');
+            pauseIcon.classList.add('hidden');
+        } else {
+            playIcon.classList.add('hidden');
+            pauseIcon.classList.remove('hidden');
+        }
+    }
+
+    // Fullscreen ses ikonu (Material Icons Round)
+    updateFsVolumeIcon();
+
+    // Volume slider
+    const volumeSlider = document.getElementById('fsVolumeSlider');
+    const volumeLabel = document.getElementById('fsVolumeLabel');
+
+    if (volumeSlider && volumeLabel && !video.muted) {
+        const volume = Math.round(video.volume * 100);
+        volumeSlider.value = volume;
+        volumeLabel.textContent = volume + '%';
+    }
+}
+
+function formatTime(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '00:00';
+
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+// Video menü göster
+function showVideoMenu(e) {
+    // Basit bir menü göster
+    const menu = document.createElement('div');
+    menu.className = 'context-menu video-menu';
+    menu.style.position = 'fixed';
+    menu.style.right = '60px';
+    menu.style.bottom = '20px';
+    menu.innerHTML = `
+        <div class="context-menu-item" onclick="toggleVideoFullscreen()">
+            <span>Tam Ekran</span>
+        </div>
+        <div class="context-menu-item" onclick="elements.videoPlayer.playbackRate = 0.5">
+            <span>0.5x Hız</span>
+        </div>
+        <div class="context-menu-item" onclick="elements.videoPlayer.playbackRate = 1">
+            <span>Normal Hız</span>
+        </div>
+        <div class="context-menu-item" onclick="elements.videoPlayer.playbackRate = 1.5">
+            <span>1.5x Hız</span>
+        </div>
+        <div class="context-menu-item" onclick="elements.videoPlayer.playbackRate = 2">
+            <span>2x Hız</span>
+        </div>
+    `;
+
+    // Önceki menüyü kaldır
+    const oldMenu = document.querySelector('.video-menu');
+    if (oldMenu) oldMenu.remove();
+
+    document.body.appendChild(menu);
+
+    // Dışarı tıklanınca kapat
+    setTimeout(() => {
+        document.addEventListener('click', function closeMenu(evt) {
+            if (!menu.contains(evt.target)) {
+                menu.remove();
+                document.removeEventListener('click', closeMenu);
+            }
+        });
+    }, 100);
 }
 
 // Aktif audio player'ı getir
@@ -480,11 +2248,24 @@ function switchActivePlayer() {
 function handleSidebarClick(btn) {
     const page = btn.dataset.page;
     const panel = btn.dataset.panel;
-    
+
+    // Utility pages should not remain open when switching tabs
+    closeAllUtilityPages();
+
     // Sidebar butonlarını güncelle
     elements.sidebarBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    
+
+    // Video sekmesine geçildiğinde müziği durdur
+    if (page === 'video' && state.isPlaying && state.activeMedia === 'audio') {
+        stopAudio();
+        state.isPlaying = false;
+        updatePlayPauseIcon(false);
+        updateCoverArt(null, 'video'); // Video ikonunu göster
+        updateTrayState();
+        updateMPRISMetadata();
+    }
+
     // Media filtresini ayarla
     if (page === 'music' || page === 'files') {
         state.mediaFilter = 'audio';
@@ -493,10 +2274,10 @@ function handleSidebarClick(btn) {
     } else {
         state.mediaFilter = 'all';
     }
-    
+
     // *** SEKMELERİ İZOLE ET - DİĞER MEDYALARI KAPAT ***
     isolateMediaSection(page);
-    
+
     // Panel değiştir
     if (panel === 'library') {
         elements.libraryPanel.classList.remove('hidden');
@@ -505,14 +2286,32 @@ function handleSidebarClick(btn) {
         elements.libraryPanel.classList.add('hidden');
         elements.webPanel.classList.remove('hidden');
     }
-    
+
     // Sayfa değiştir
     switchPage(page);
     state.currentPage = page;
     state.currentPanel = panel;
-    
-    // Klasör içeriğini yeniden yükle (filtre uygulanacak)
-    if (state.currentPath) {
+
+    // Sekme bazlı konum değiştirme
+    if (page === 'music' || page === 'files') {
+        // Müzik sekmesine geçildiğinde
+        const home = window.aurivo.getHomeDir();
+        const defaultMusicPath = window.aurivo.path.join(home, 'Müzik');
+
+        if (state.lastAudioPath) {
+            // Önceki müzik konumuna git
+            loadDirectory(state.lastAudioPath, false);
+        } else {
+            // İlk kez müzik sekmesine geçiliyor, Müzik klasörüne git
+            loadDirectory(defaultMusicPath, false);
+        }
+    } else if (page === 'video') {
+        // Video sekmesine geçildiğinde
+        const home = window.aurivo.getHomeDir();
+        const defaultVideoPath = state.lastVideoPath || window.aurivo.path.join(home, 'Videolar');
+        loadDirectory(defaultVideoPath, false);
+    } else if (state.currentPath) {
+        // Diğer sekmeler için normal yükleme
         loadDirectory(state.currentPath, false);
     }
 }
@@ -547,7 +2346,7 @@ function isolateMediaSection(targetPage) {
 
 function stopAudio() {
     console.log('stopAudio çağrıldı, useNativeAudio:', useNativeAudio);
-    
+
     // C++ Audio Engine durdur - HER ZAMAN dene (useNativeAudio değerine bakılmaksızın)
     if (window.aurivo && window.aurivo.audio) {
         console.log('C++ Audio Engine durduruluyor...');
@@ -559,7 +2358,7 @@ function stopAudio() {
         }
     }
     stopNativePositionUpdates();
-    
+
     // Her iki HTML5 player'ı da durdur
     if (elements.audioA) {
         elements.audioA.pause();
@@ -571,12 +2370,12 @@ function stopAudio() {
         elements.audioB.src = '';
         elements.audioB.load(); // Tamamen sıfırla
     }
-    
+
     // Crossfade state'lerini sıfırla
     state.crossfadeInProgress = false;
     state.autoCrossfadeTriggered = false;
     state.trackAboutToEnd = false;
-    
+
     // Müzik için state'i sıfırla
     if (state.activeMedia === 'audio') {
         state.isPlaying = false;
@@ -597,10 +2396,10 @@ function stopWeb() {
         // WebView'ı durdur (RAM temizliği)
         try {
             elements.webView.stop();
-            // Sessiz sayfa - data URL kullan
-            elements.webView.src = 'data:text/html,<html><body style="background:#121212"></body></html>';
+            // Sessiz sayfa yükle - about:blank kullan (data URL yerine)
+            elements.webView.loadURL('about:blank');
         } catch (e) {
-            // WebView henüz yüklenmemiş olabilir
+            // WebView henüz yüklenmemiş olabilir - yoksay
         }
     }
     // Platform butonlarından active kaldır
@@ -608,13 +2407,18 @@ function stopWeb() {
 }
 
 function switchPage(pageName) {
+    // Utility buttons should not stay active when switching main pages
+    if (elements.downloadBtn) elements.downloadBtn.classList.remove('active');
+    if (elements.settingsBtn) elements.settingsBtn.classList.remove('active');
+    if (elements.securityBtn) elements.securityBtn.classList.remove('active');
+
     elements.pages.forEach(p => {
         p.classList.remove('active');
         p.classList.add('hidden');
     });
-    
+
     let targetPage;
-    switch(pageName) {
+    switch (pageName) {
         case 'files':
         case 'music':
             targetPage = elements.musicPage;
@@ -628,7 +2432,7 @@ function switchPage(pageName) {
         default:
             targetPage = elements.musicPage;
     }
-    
+
     targetPage.classList.remove('hidden');
     targetPage.classList.add('active');
 }
@@ -636,30 +2440,45 @@ function switchPage(pageName) {
 function handlePlatformClick(btn) {
     const url = btn.dataset.url;
     const platform = btn.dataset.platform || 'web';
-    
+
+    // Utility pages should not remain open when switching to a platform
+    closeAllUtilityPages();
+
     // Önce diğer medyaları kapat (RAM tasarrufu)
     stopAudio();
     stopVideo();
     state.activeMedia = 'web';
-    
+    state.webTitle = '';
+    state.webArtist = '';
+    state.webAlbum = '';
+
     // Tüm platform butonlarından active kaldır
     elements.platformBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    
+
     // WebView'a URL yükle
     if (elements.webView) {
-        elements.webView.src = url;
+        try {
+            elements.webView.loadURL(url);
+        } catch (e) {
+            // Webview yükleme hatası - yoksay
+            console.warn('WebView URL yükleme hatası:', e.message);
+        }
     }
-    
+
     // Web sayfasına geç
     switchPage('web');
-    
+
     // Now playing güncelle
     const platformName = btn.querySelector('span').textContent;
     elements.nowPlayingLabel.textContent = 'Şu An Çalınan: ' + platformName;
-    
+
     // Platform logosunu kapak olarak göster
     updatePlatformCover(platform);
+
+    // Sistem entegrasyonunu güncelle (MPRIS/Tray)
+    updateTrayState();
+    updateMPRISMetadata();
 }
 
 // Platform logosunu kapak olarak ayarla
@@ -673,9 +2492,9 @@ function updatePlatformCover(platform) {
         'mixcloud': 'icons/nav_internet.svg',
         'web': 'icons/nav_internet.svg'
     };
-    
+
     const coverUrl = platformCovers[platform] || platformCovers['web'];
-    
+
     if (elements.coverArt) {
         elements.coverArt.src = coverUrl;
         elements.coverArt.classList.add('default-cover');
@@ -717,36 +2536,36 @@ function refreshCurrentView() {
 // ============================================
 async function initializeFileTree() {
     console.log('initializeFileTree başlatılıyor...');
-    
+
     // fileTree elementini kontrol et
     if (!elements.fileTree) {
         elements.fileTree = document.getElementById('fileTree');
     }
-    
+
     if (!elements.fileTree) {
         console.error('fileTree elementi bulunamadı!');
         return;
     }
-    
+
     // Home dizinini belirle
-    const home = '/home/muhammed-dali';
-    
+    const home = window.aurivo.getHomeDir();
+
     // Başlangıç path'ini ayarla (history için önemli!)
     state.currentPath = home;
     state.pathHistory = [];
     state.pathForward = [];
-    
+
     // Kullanıcının eklediği klasörleri yükle
     const savedFolders = loadSavedFolders();
-    
+
     // Varsayılan klasörler (Videolar kaldırıldı)
     const defaultFolders = [
-        { name: 'Müzik', path: home + '/Müzik', icon: '🎵' },
-        { name: 'İndirilenler', path: home + '/İndirilenler', icon: '📥' }
+        { name: 'Müzik', path: window.aurivo.path.join(home, 'Müzik'), icon: '🎵' },
+        { name: 'İndirilenler', path: window.aurivo.path.join(home, 'İndirilenler'), icon: '📥' }
     ];
-    
+
     elements.fileTree.innerHTML = '';
-    
+
     // "Dosya/Klasör Ekle" butonu
     const addFolderBtn = document.createElement('div');
     addFolderBtn.className = 'tree-item add-folder-btn';
@@ -756,12 +2575,12 @@ async function initializeFileTree() {
     `;
     addFolderBtn.addEventListener('click', openFolderDialog);
     elements.fileTree.appendChild(addFolderBtn);
-    
+
     // Ayırıcı çizgi
     const separator = document.createElement('div');
     separator.className = 'tree-separator';
     elements.fileTree.appendChild(separator);
-    
+
     // Kullanıcının eklediği klasörler (varsa)
     savedFolders.forEach(folder => {
         const item = createTreeItem(folder.name, folder.path, true, '📌');
@@ -770,13 +2589,13 @@ async function initializeFileTree() {
         item.dataset.userFolder = 'true';
         elements.fileTree.appendChild(item);
     });
-    
+
     // Varsayılan klasörler
     defaultFolders.forEach(folder => {
         const item = createTreeItem(folder.name, folder.path, true, folder.icon);
         elements.fileTree.appendChild(item);
     });
-    
+
     console.log('File Tree yüklendi -', defaultFolders.length + savedFolders.length, 'klasör');
 }
 
@@ -815,19 +2634,19 @@ async function openFolderDialog() {
 // Kullanıcı klasörü ekle
 function addUserFolder(path, name) {
     const folders = loadSavedFolders();
-    
+
     // Zaten ekli mi kontrol et
     if (folders.some(f => f.path === path)) {
         console.log('Bu klasör zaten ekli:', path);
         return;
     }
-    
+
     folders.push({ name, path });
     saveFolders(folders);
-    
+
     // File tree'yi yeniden yükle
     initializeFileTree();
-    
+
     console.log('Klasör eklendi:', name, path);
 }
 
@@ -836,10 +2655,10 @@ function removeUserFolder(path) {
     let folders = loadSavedFolders();
     folders = folders.filter(f => f.path !== path);
     saveFolders(folders);
-    
+
     // File tree'yi yeniden yükle
     initializeFileTree();
-    
+
     console.log('Klasör kaldırıldı:', path);
 }
 
@@ -847,12 +2666,12 @@ function removeUserFolder(path) {
 function handleFileTreeClick(e) {
     const item = e.target.closest('.tree-item');
     if (!item) return;
-    
+
     const path = item.dataset.path;
     const isDirectory = item.dataset.isDirectory === 'true' || item.classList.contains('folder');
-    
+
     console.log('Tıklanan:', path, 'Klasör:', isDirectory);
-    
+
     if (isDirectory) {
         loadDirectory(path);
     } else {
@@ -866,11 +2685,11 @@ function handleFileTreeClick(e) {
 function handleFileTreeDblClick(e) {
     const item = e.target.closest('.tree-item');
     if (!item) return;
-    
+
     const path = item.dataset.path;
     const isDirectory = item.dataset.isDirectory === 'true' || item.classList.contains('folder');
     const name = item.dataset.name || path.split('/').pop();
-    
+
     if (isDirectory) {
         loadDirectory(path);
     } else {
@@ -897,12 +2716,12 @@ function handleFileTreeDblClickGlobal(e) {
 function handleFileTreeContextMenu(e) {
     const item = e.target.closest('.tree-item.user-folder');
     if (!item) return;
-    
+
     e.preventDefault();
-    
+
     const path = item.dataset.path;
     const name = item.dataset.name;
-    
+
     showFolderContextMenu(e.clientX, e.clientY, path, name);
 }
 
@@ -910,7 +2729,7 @@ function showFolderContextMenu(x, y, path, name) {
     // Varolan menüyü kaldır
     let menu = document.getElementById('folderContextMenu');
     if (menu) menu.remove();
-    
+
     // Yeni menü oluştur
     menu = document.createElement('div');
     menu.id = 'folderContextMenu';
@@ -925,19 +2744,19 @@ function showFolderContextMenu(x, y, path, name) {
             <span>Klasörü Aç</span>
         </div>
     `;
-    
+
     document.body.appendChild(menu);
-    
+
     // Pozisyon ayarla
     menu.style.left = x + 'px';
     menu.style.top = y + 'px';
-    
+
     // Menü öğelerine tıklama
     menu.querySelector('[data-action="remove"]').addEventListener('click', () => {
         removeUserFolder(path);
         menu.remove();
     });
-    
+
     menu.querySelector('[data-action="open"]').addEventListener('click', () => {
         loadDirectory(path);
         menu.remove();
@@ -951,10 +2770,10 @@ function createTreeItem(name, path, isDirectory, icon = null) {
     item.dataset.isDirectory = isDirectory;
     item.dataset.name = name;
     item.tabIndex = 0; // Klavye fokus için
-    
+
     const iconSpan = document.createElement('span');
     iconSpan.className = 'tree-icon';
-    
+
     if (!icon) {
         if (isDirectory) {
             icon = '📁';
@@ -964,26 +2783,26 @@ function createTreeItem(name, path, isDirectory, icon = null) {
         }
     }
     iconSpan.textContent = icon;
-    
+
     const nameSpan = document.createElement('span');
     nameSpan.className = 'tree-name';
     nameSpan.textContent = name;
-    
+
     item.appendChild(iconSpan);
     item.appendChild(nameSpan);
-    
+
     // Tek tıklama - seçim (CTRL ile çoklu seçim)
     item.addEventListener('click', (e) => {
         e.stopPropagation();
         handleTreeItemClick(item, path, isDirectory, e);
     });
-    
+
     // Çift tıklama - aç/çal
     item.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         handleTreeItemDoubleClick(path, isDirectory, name);
     });
-    
+
     // Klavye işlemleri - tree item üzerinde
     item.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -991,14 +2810,14 @@ function createTreeItem(name, path, isDirectory, icon = null) {
             addSelectedFilesToPlaylist();
         }
     });
-    
+
     // Draggable yap (dosyalar için)
     if (!isDirectory) {
         item.draggable = true;
         item.addEventListener('dragstart', handleTreeItemDragStart);
         item.addEventListener('dragend', handleTreeItemDragEnd);
     }
-    
+
     return item;
 }
 
@@ -1008,21 +2827,21 @@ let lastClickedFileItem = null;
 // Çoklu seçim ile tree item tıklama
 function handleTreeItemClick(item, path, isDirectory, e) {
     console.log('Tree item tıklandı:', path, 'Klasör:', isDirectory);
-    
+
     // Klasörse sadece aç
     if (isDirectory) {
         console.log('Klasör açılıyor:', path);
         loadDirectory(path);
         return;
     }
-    
+
     // SHIFT tuşu - aralık seçimi
     if (e && e.shiftKey && lastClickedFileItem && !isDirectory) {
         e.preventDefault();
         selectFileRange(lastClickedFileItem, item);
         return;
     }
-    
+
     // CTRL tuşu basılıysa çoklu seçim (toggle)
     if (e && e.ctrlKey && !isDirectory) {
         item.classList.toggle('selected');
@@ -1031,7 +2850,7 @@ function handleTreeItemClick(item, path, isDirectory, e) {
         }
         return;
     }
-    
+
     // Normal tıklama - sadece bu öğeyi seç
     document.querySelectorAll('.tree-item.file').forEach(i => i.classList.remove('selected'));
     item.classList.add('selected');
@@ -1043,17 +2862,17 @@ function selectFileRange(startItem, endItem) {
     const allFiles = Array.from(document.querySelectorAll('.tree-item.file'));
     const startIndex = allFiles.indexOf(startItem);
     const endIndex = allFiles.indexOf(endItem);
-    
+
     if (startIndex === -1 || endIndex === -1) return;
-    
+
     const minIndex = Math.min(startIndex, endIndex);
     const maxIndex = Math.max(startIndex, endIndex);
-    
+
     // Aralıktaki tüm dosyaları seç
     for (let i = minIndex; i <= maxIndex; i++) {
         allFiles[i].classList.add('selected');
     }
-    
+
     console.log('SHIFT+Click: ' + (maxIndex - minIndex + 1) + ' dosya seçildi');
 }
 
@@ -1061,11 +2880,18 @@ function handleTreeItemDoubleClick(path, isDirectory, name = null) {
     if (isDirectory) {
         loadDirectory(path);
     } else {
-        // Dosyayı playlist'e ekle ve çal
         const fileName = name || path.split('/').pop();
-        const { index } = addToPlaylist(path, fileName);
-        if (typeof index === 'number' && index >= 0) {
-            playIndex(index);
+
+        // Video mu, müzik mi kontrol et
+        if (isVideoFile(fileName)) {
+            // Video: Playlist'e ekleme, direkt çal
+            playVideo(path);
+        } else {
+            // Müzik: Playlist'e ekle ve çal
+            const { index } = addToPlaylist(path, fileName);
+            if (typeof index === 'number' && index >= 0) {
+                playIndex(index);
+            }
         }
     }
 }
@@ -1075,11 +2901,11 @@ async function loadDirectory(dirPath, pushHistory = true) {
         console.error('Aurivo API bulunamadı');
         return;
     }
-    
+
     try {
         console.log('Klasör yükleniyor:', dirPath, 'pushHistory:', pushHistory);
         console.log('Önceki currentPath:', state.currentPath, 'History:', state.pathHistory.length);
-        
+
         if (pushHistory && state.currentPath && state.currentPath !== dirPath) {
             state.pathHistory.push(state.currentPath);
             state.pathForward = [];
@@ -1087,28 +2913,56 @@ async function loadDirectory(dirPath, pushHistory = true) {
         }
         state.currentPath = dirPath;
         console.log('Yeni currentPath:', state.currentPath);
-        
+
+        // Sekme bazlı konum hafızasını güncelle
+        if (state.mediaFilter === 'audio') {
+            state.lastAudioPath = dirPath;
+        } else if (state.mediaFilter === 'video') {
+            state.lastVideoPath = dirPath;
+        }
+
         const items = await window.aurivo.readDirectory(dirPath);
         console.log('Okunan öğeler:', items.length);
-        
+
         elements.fileTree.innerHTML = '';
-        
+
         // Klasörler önce
         const folders = items
             .filter(i => i.isDirectory)
             .sort((a, b) => a.name.localeCompare(b.name, 'tr'));
-        
-        // Dosyaları filtrele - SADECE SES DOSYALARI
+
+        // Dosyaları filtrele - mediaFilter'a göre
         let files = items.filter(i => i.isFile);
-        
-        // Sadece desteklenen ses dosyalarını göster
-        files = files.filter(i => {
-            const ext = i.name.split('.').pop().toLowerCase();
-            return AUDIO_EXTENSIONS.includes(ext);
-        });
-        
+
+        // mediaFilter'a göre filtreleme
+        if (state.mediaFilter === 'audio') {
+            // Sadece ses dosyalarını göster
+            files = files.filter(i => {
+                const ext = i.name.split('.').pop().toLowerCase();
+                return AUDIO_EXTENSIONS.includes(ext);
+            });
+        } else if (state.mediaFilter === 'video') {
+            // Sadece video dosyalarını göster
+            files = files.filter(i => {
+                const ext = i.name.split('.').pop().toLowerCase();
+                return VIDEO_EXTENSIONS.includes(ext);
+            });
+        } else if (state.mediaFilter === 'web') {
+            // Web sekmesinde dosya ağacı gösterilmez
+            files = [];
+        }
+
         files.sort((a, b) => a.name.localeCompare(b.name, 'tr'));
-        
+
+        // Video sekmesinde klasördeki tüm videoları kaydet (sıralı çalma için)
+        if (state.mediaFilter === 'video') {
+            state.videoFiles = files.map(f => ({
+                name: f.name,
+                path: f.path
+            }));
+            console.log('Video dosyaları kaydedildi:', state.videoFiles.length);
+        }
+
         // Klasörleri ekle (gizli klasörleri atla)
         folders.forEach(item => {
             if (!item.name.startsWith('.')) {
@@ -1116,7 +2970,7 @@ async function loadDirectory(dirPath, pushHistory = true) {
                 elements.fileTree.appendChild(treeItem);
             }
         });
-        
+
         // Dosyaları ekle (gizli dosyaları atla)
         files.forEach(item => {
             if (!item.name.startsWith('.')) {
@@ -1124,9 +2978,9 @@ async function loadDirectory(dirPath, pushHistory = true) {
                 elements.fileTree.appendChild(treeItem);
             }
         });
-        
+
         console.log('Yüklendi:', folders.length, 'klasör,', files.length, 'dosya');
-        
+
     } catch (error) {
         console.error('Klasör yükleme hatası:', error);
     }
@@ -1165,7 +3019,7 @@ async function savePlaylistToDisk() {
 
 function renderPlaylist() {
     elements.playlist.innerHTML = '';
-    
+
     if (state.playlist.length === 0) {
         elements.playlist.innerHTML = `
             <div class="playlist-empty">
@@ -1176,7 +3030,7 @@ function renderPlaylist() {
         `;
         return;
     }
-    
+
     state.playlist.forEach((item, index) => {
         const div = document.createElement('div');
         div.className = 'playlist-item';
@@ -1184,7 +3038,7 @@ function renderPlaylist() {
             div.classList.add('playing');
         }
         div.dataset.index = index;
-        
+
         const icon = isVideoFile(item.name) ? '🎬' : '🎵';
         div.innerHTML = `
             <span class="item-index">${index + 1}</span>
@@ -1192,20 +3046,20 @@ function renderPlaylist() {
             <span class="item-name">${item.name}</span>
             <button class="item-remove" data-index="${index}">✕</button>
         `;
-        
+
         div.addEventListener('click', () => selectPlaylistItem(index));
         div.addEventListener('dblclick', () => {
             console.log('[PLAYLIST] Double-click on item', index, ':', item.name);
             playIndex(index);
         });
-        
+
         // Kaldır butonu
         const removeBtn = div.querySelector('.item-remove');
         removeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             removeFromPlaylist(index);
         });
-        
+
         elements.playlist.appendChild(div);
     });
 }
@@ -1218,7 +3072,13 @@ function selectPlaylistItem(index) {
 
 function addToPlaylist(filePath, fileName = null) {
     const name = fileName || filePath.split('/').pop();
-    
+
+    // Video dosyalarını playlist'e ekleme - sadece ses dosyaları!
+    if (isVideoFile(name)) {
+        console.log('[PLAYLIST] Video dosyası reddedildi:', name);
+        return { index: -1, added: false };
+    }
+
     // Zaten listede var mı kontrol et
     const existingIndex = state.playlist.findIndex(item => item.path === filePath);
     if (existingIndex !== -1) {
@@ -1233,7 +3093,7 @@ function addToPlaylist(filePath, fileName = null) {
 
 function removeFromPlaylist(index) {
     state.playlist.splice(index, 1);
-    
+
     // Çalan parça kaldırıldıysa
     if (index === state.currentIndex) {
         elements.audio.pause();
@@ -1243,7 +3103,7 @@ function removeFromPlaylist(index) {
     } else if (index < state.currentIndex) {
         state.currentIndex--;
     }
-    
+
     renderPlaylist();
     savePlaylistToDisk();
 }
@@ -1252,16 +3112,17 @@ function handleFileDrop(e) {
     e.preventDefault();
     let addedCount = 0;
     let firstPlayableIndex = null;
-    
+
     // Önce Aurivo internal sürüklemesini kontrol et (file tree'den)
     const aurivoData = e.dataTransfer.getData('text/aurivo-files');
     if (aurivoData) {
         try {
             const files = JSON.parse(aurivoData);
             files.forEach(file => {
-                if (isMediaFile(file.name)) {
+                // Video dosyalarını playlist'e ekleme (sadece ses dosyaları)
+                if (isAudioFile(file.name)) {
                     const { index, added } = addToPlaylist(file.path, file.name);
-                    if (typeof index === 'number') {
+                    if (typeof index === 'number' && index >= 0) {
                         if (firstPlayableIndex === null) firstPlayableIndex = index;
                         if (added) addedCount++;
                     }
@@ -1275,24 +3136,25 @@ function handleFileDrop(e) {
         const files = e.dataTransfer.files;
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
-            if (isMediaFile(file.name)) {
+            // Video dosyalarını playlist'e ekleme (sadece ses dosyaları)
+            if (isAudioFile(file.name)) {
                 const { index, added } = addToPlaylist(file.path, file.name);
-                if (typeof index === 'number') {
+                if (typeof index === 'number' && index >= 0) {
                     if (firstPlayableIndex === null) firstPlayableIndex = index;
                     if (added) addedCount++;
                 }
             }
         }
     }
-    
+
     // İlk dosyayı çal (eğer hiçbir şey çalmıyorsa)
     if (state.currentIndex === -1 && typeof firstPlayableIndex === 'number' && firstPlayableIndex >= 0) {
         playIndex(firstPlayableIndex);
     }
-    
+
     // Seçimleri temizle
     document.querySelectorAll('.tree-item.file').forEach(i => i.classList.remove('selected'));
-    
+
     console.log(`${addedCount} dosya eklendi`);
 }
 
@@ -1301,25 +3163,125 @@ function addSelectedFilesToPlaylist() {
     const selectedItems = document.querySelectorAll('.tree-item.file.selected');
     let addedCount = 0;
     let firstPlayableIndex = null;
-    
+
     selectedItems.forEach(item => {
         const path = item.dataset.path;
         const name = item.dataset.name;
-        if (path && name && isMediaFile(name)) {
+        // Video dosyalarını playlist'e ekleme (sadece ses dosyaları)
+        if (path && name && isAudioFile(name)) {
             const { index, added } = addToPlaylist(path, name);
-            if (typeof index === 'number') {
+            if (typeof index === 'number' && index >= 0) {
                 if (firstPlayableIndex === null) firstPlayableIndex = index;
                 if (added) addedCount++;
             }
         }
     });
-    
+
     // İlk dosyayı çal (eğer hiçbir şey çalmıyorsa)
     if (state.currentIndex === -1 && typeof firstPlayableIndex === 'number' && firstPlayableIndex >= 0) {
         playIndex(firstPlayableIndex);
     }
-    
+
     console.log(`ENTER: ${addedCount} dosya eklendi`);
+}
+
+// ============================================
+// VIDEO PLAYBACK (Playlist'siz, direkt kütüphaneden)
+// ============================================
+function playVideo(videoPath) {
+    console.log('[PLAY VIDEO] Video oynatılıyor:', videoPath);
+
+    // Müziği tamamen durdur
+    stopAudio();
+    stopWeb();
+
+    // Videolar listesinde bu videonun indeksini bul
+    const videoIndex = state.videoFiles.findIndex(v => v.path === videoPath);
+    if (videoIndex === -1) {
+        console.error('Video listede bulunamadı:', videoPath);
+        return;
+    }
+
+    state.currentVideoIndex = videoIndex;
+    state.currentVideoPath = videoPath;
+    state.activeMedia = 'video';
+
+    // Video sayfasına geç
+    switchPage('video');
+
+    // Video player'ı ayarla ve oynat
+    elements.videoPlayer.src = 'file://' + videoPath;
+
+    // Video ses seviyesini ayarla (kaydedilen seviye)
+    elements.videoPlayer.volume = state.volume / 100;
+
+    // Tam ekran ses kontrollerini başlat
+    const fsVolumeSlider = document.getElementById('fsVolumeSlider');
+    const fsVolumeLabel = document.getElementById('fsVolumeLabel');
+    if (fsVolumeSlider) {
+        fsVolumeSlider.value = state.volume;
+    }
+    if (fsVolumeLabel) {
+        fsVolumeLabel.textContent = state.volume + '%';
+    }
+
+    elements.videoPlayer.play();
+
+    // Video ikonu göster
+    updateCoverArt(null, 'video');
+
+    state.isPlaying = true;
+    updatePlayPauseIcon(true);
+
+    const fileName = videoPath.split('/').pop();
+    elements.nowPlayingLabel.textContent = 'Şu An Çalınan: ' + fileName;
+
+    // Tray ve MPRIS'i güncelle
+    updateTrayState();
+    updateMPRISMetadata();
+
+    console.log('[PLAY VIDEO] Video başlatıldı, index:', videoIndex, 'toplam:', state.videoFiles.length);
+}
+
+// Sıradaki videoyu oynat
+function playNextVideo() {
+    if (state.videoFiles.length === 0) {
+        console.log('[NEXT VIDEO] Video listesi boş');
+        return;
+    }
+
+    const nextIndex = state.currentVideoIndex + 1;
+
+    if (nextIndex < state.videoFiles.length) {
+        // Sıradaki video var
+        console.log('[NEXT VIDEO] Sıradaki video oynatılıyor:', nextIndex);
+        playVideo(state.videoFiles[nextIndex].path);
+    } else {
+        // Liste bitti
+        console.log('[NEXT VIDEO] Video listesi bitti');
+        state.isPlaying = false;
+        updatePlayPauseIcon(false);
+        updateTrayState();
+    }
+}
+
+// Önceki videoyu oynat
+function playPreviousVideo() {
+    if (state.videoFiles.length === 0) {
+        console.log('[PREV VIDEO] Video listesi boş');
+        return;
+    }
+
+    const prevIndex = state.currentVideoIndex - 1;
+
+    if (prevIndex >= 0) {
+        // Önceki video var
+        console.log('[PREV VIDEO] Önceki video oynatılıyor:', prevIndex);
+        playVideo(state.videoFiles[prevIndex].path);
+    } else {
+        // Liste başı
+        console.log('[PREV VIDEO] Liste başında');
+    }
 }
 
 // ============================================
@@ -1334,86 +3296,80 @@ function playFile(filePath) {
 
 async function playIndex(index) {
     console.log('[PLAYINDEX] çağrıldı, index:', index, 'playlist length:', state.playlist.length);
-    
+
     if (index < 0 || index >= state.playlist.length) {
         console.log('[PLAYINDEX] Geçersiz index, iptal ediliyor');
         return;
     }
-    
+
     const item = state.playlist[index];
     console.log('[PLAYINDEX] Çalınacak dosya:', item.path);
     console.log('[PLAYINDEX] Current index before:', state.currentIndex, '-> after:', index);
-    
+
     state.currentIndex = index;
-    
-    if (isVideoFile(item.name)) {
-        // Önce diğer medyaları kapat
-        stopAudio();
-        stopWeb();
-        
-        // Video oynat
-        state.activeMedia = 'video';
-        switchPage('video');
-        elements.videoPlayer.src = 'file://' + item.path;
-        elements.videoPlayer.play();
-        
-        // Video thumbnail'i göster (varsayılan video ikonu)
-        updateCoverArt(null, 'video');
-    } else {
-        // Önce TÜM medyaları kapat (önceki şarkı dahil)
-        console.log('Audio: Önce tüm medyalar durduruluyor...');
-        stopAudio();
-        stopVideo();
-        stopWeb();
-        console.log('Audio: Medyalar durduruldu, yeni şarkı yükleniyor...');
-        
-        // Audio oynat
-        state.activeMedia = 'audio';
-        if (state.currentPage === 'video' || state.currentPage === 'web') {
-            switchPage('music');
-        }
-        
-        // C++ Audio Engine veya HTML5 Audio kullan
-        if (useNativeAudio) {
-            console.log('C++ BASS Engine ile oynatılıyor...');
-            // C++ BASS Engine ile oynat
-            const result = await window.aurivo.audio.loadFile(item.path);
-            console.log('loadFile sonucu:', result);
-            console.log('loadFile sonucu type:', typeof result, 'success check:', result === true, 'object success:', result && result.success);
-            if (result && result.error) {
-                console.log('🔥 BASS Audio Engine hatası:', result.error);
-            }
-            if (result === true || (result && result.success)) {
-                window.aurivo.audio.setVolume((state.volume || 0) / 100);
-                console.log('🎵 window.aurivo.audio.play() çağrılıyor...');
-                window.aurivo.audio.play();
-                console.log('🎵 play() çağrıldı, ses çıkması gerekiyor');
-                startNativePositionUpdates();
-            } else {
-                console.error('C++ Audio Engine dosya yükleyemedi', result);
-                showNotification('Native audio ile dosya yüklenemedi. Efektler için native audio gerekli.', 'error');
-                return;
-            }
-        } else {
-            console.log('HTML5 Audio ile oynatılıyor...');
-            // HTML5 Audio ile oynat
-            playWithHTML5Audio(item);
-        }
-        
-        // Albüm kapağını çıkar
-        console.log('playIndex: extractAlbumArt çağrılıyor, path:', item.path);
-        extractAlbumArt(item.path);
+
+    // NOT: Video artık playlist'e eklenmiyor, direkt playVideo() ile çalıştırılıyor
+    // Bu fonksiyon sadece müzik için kullanılıyor
+
+    // Önce TÜM medyaları kapat (önceki şarkı dahil)
+    console.log('Audio: Önce tüm medyalar durduruluyor...');
+    stopAudio();
+    stopVideo();
+    stopWeb();
+    console.log('Audio: Medyalar durduruldu, yeni şarkı yükleniyor...');
+
+    // Audio oynat
+    state.activeMedia = 'audio';
+    if (state.currentPage === 'video' || state.currentPage === 'web') {
+        switchPage('music');
     }
-    
+
+    // C++ Audio Engine veya HTML5 Audio kullan
+    if (useNativeAudio) {
+        console.log('C++ BASS Engine ile oynatılıyor...');
+        // C++ BASS Engine ile oynat
+        const result = await window.aurivo.audio.loadFile(item.path);
+        console.log('loadFile sonucu:', result);
+        console.log('loadFile sonucu type:', typeof result, 'success check:', result === true, 'object success:', result && result.success);
+        if (result && result.error) {
+            console.log('🔥 BASS Audio Engine hatası:', result.error);
+        }
+        if (result === true || (result && result.success)) {
+            window.aurivo.audio.setVolume((state.volume || 0) / 100);
+            console.log('🎵 window.aurivo.audio.play() çağrılıyor...');
+            window.aurivo.audio.play();
+            console.log('🎵 play() çağrıldı, ses çıkması gerekiyor');
+            startNativePositionUpdates();
+        } else {
+            console.error('C++ Audio Engine dosya yükleyemedi', result);
+            showNotification('Native audio ile dosya yüklenemedi. Efektler için native audio gerekli.', 'error');
+            return;
+        }
+    } else {
+        console.log('HTML5 Audio ile oynatılıyor...');
+        // HTML5 Audio ile oynat
+        playWithHTML5Audio(item);
+    }
+
+    // Albüm kapağını çıkar
+    console.log('playIndex: extractAlbumArt çağrılıyor, path:', item.path);
+    extractAlbumArt(item.path);
+
     // Crossfade state'lerini sıfırla
     state.autoCrossfadeTriggered = false;
     state.trackAboutToEnd = false;
     state.trackAboutToEndTriggered = false;
-    
+
     state.isPlaying = true;
     updatePlayPauseIcon(true);
     elements.nowPlayingLabel.textContent = 'Şu An Çalınan: ' + item.name;
     renderPlaylist();
+
+    // System tray'i güncelle
+    updateTrayState();
+
+    // MPRIS metadata güncelle (Linux ortam oynatıcısı)
+    updateMPRISMetadata();
 }
 
 // HTML5 Audio ile oynat (fallback)
@@ -1428,7 +3384,7 @@ function playWithHTML5Audio(item) {
 // Native engine ile "yumuşak/çapraz" geçiş (overlap yok: fade-out -> track switch -> fade-in)
 async function startNativeTransitionToIndex(index, ms) {
     if (state.crossfadeInProgress) return;
-    
+
     if (state.crossfadeInProgress) return;
     if (index < 0 || index >= state.playlist.length) return;
     if (!window.aurivo?.audio) {
@@ -1600,11 +3556,11 @@ async function startNativeTransitionToIndex(index, ms) {
 // C++ Engine pozisyon güncelleme
 function startNativePositionUpdates() {
     stopNativePositionUpdates();
-    
+
     console.log('Position update başlatıldı');
 
     const myGen = ++state.nativePositionGeneration;
-    
+
     state.nativePositionTimer = setInterval(async () => {
         if (myGen !== state.nativePositionGeneration) return;
         if (!useNativeAudio) {
@@ -1614,7 +3570,7 @@ function startNativePositionUpdates() {
         if (!state.isPlaying) {
             return;
         }
-        
+
         try {
             // IPC çağrıları async
             const positionMs = await window.aurivo.audio.getPosition(); // milisaniye
@@ -1623,9 +3579,9 @@ function startNativePositionUpdates() {
 
             // Bu tick sırasında stop/restart olduysa hiçbir şey yapma
             if (myGen !== state.nativePositionGeneration) return;
-            
+
             const positionSec = positionMs / 1000;
-            
+
             // UI güncelle
             if (elements.currentTime) {
                 elements.currentTime.textContent = formatTime(positionSec);
@@ -1633,13 +3589,20 @@ function startNativePositionUpdates() {
             if (elements.durationTime) {
                 elements.durationTime.textContent = formatTime(durationSec);
             }
-            
+
             if (durationSec > 0 && elements.seekSlider) {
                 const progress = (positionSec / durationSec) * 1000;
                 elements.seekSlider.value = progress;
                 updateRainbowSlider(elements.seekSlider, progress / 10);
             }
-            
+
+            // MPRIS position'ı güncelle (her tam saniyede bir)
+            const currentSecInt = Math.floor(positionSec);
+            if (currentSecInt !== state.lastMPRISPosition && currentSecInt % 2 === 0) {
+                state.lastMPRISPosition = currentSecInt;
+                updateMPRISMetadata();
+            }
+
             // Şarkı bitti mi kontrol et
             const durationMs = durationSec * 1000;
 
@@ -1653,7 +3616,7 @@ function startNativePositionUpdates() {
             const gap = crossfadeMs + (state.settings?.playback?.crossfadeAutoEnabled ? 0 : 1000);
             const remaining = durationMs - positionMs;
             const minimumPlayTimeMs = 3000; // 3 saniye minimum oynatma
-            
+
             // TrackAboutToEnd early warning
             if (durationMs > 0 && !state.trackAboutToEndTriggered && remaining > 0) {
                 if (remaining < gap + fudgeMs && positionMs >= minimumPlayTimeMs) {
@@ -1661,7 +3624,7 @@ function startNativePositionUpdates() {
                     console.log('[NATIVE] Track about to end, remaining:', remaining + 'ms');
                 }
             }
-            
+
             // Auto crossfade trigger
             if (state.settings?.playback?.crossfadeAutoEnabled && !state.autoCrossfadeTriggered && !state.crossfadeInProgress) {
                 if (state.trackAboutToEndTriggered && remaining > 0 && remaining <= crossfadeMs) {
@@ -1702,20 +3665,25 @@ function stopNativePositionUpdates() {
 
 function handleNativePlaybackEnd() {
     stopNativePositionUpdates();
+    console.log('[NATIVE] Playback ended');
 
     if (state.autoCrossfadeTriggered || state.crossfadeInProgress) return;
-    
+
     if (state.isRepeat) {
         playIndex(state.currentIndex);
     } else {
         const nextIdx = computeNextIndex();
-        if (nextIdx >= 0 && state.settings?.playback?.crossfadeAutoEnabled) {
-            startNativeTransitionToIndex(nextIdx, state.settings.playback.crossfadeMs || 2000).catch((e) => {
-                console.error('[CROSSFADE] Native end transition error:', e);
+        console.log('[NATIVE] Next index:', nextIdx);
+
+        if (nextIdx >= 0) {
+            if (state.settings?.playback?.crossfadeAutoEnabled) {
+                startNativeTransitionToIndex(nextIdx, state.settings.playback.crossfadeMs || 2000).catch((e) => {
+                    console.error('[CROSSFADE] Native end transition error:', e);
+                    playIndex(nextIdx);
+                });
+            } else {
                 playIndex(nextIdx);
-            });
-        } else if (nextIdx >= 0) {
-            playIndex(nextIdx);
+            }
         } else {
             state.isPlaying = false;
             updatePlayPauseIcon(false);
@@ -1727,12 +3695,12 @@ function handleNativePlaybackEnd() {
 async function extractAlbumArt(filePath) {
     console.log('=== ALBUM KAPAK CIKARMA BASLADI ===');
     console.log('Dosya yolu:', filePath);
-    
+
     try {
         if (window.aurivo && window.aurivo.getAlbumArt) {
             console.log('getAlbumArt API mevcut, çağırılıyor...');
             const coverData = await window.aurivo.getAlbumArt(filePath);
-            
+
             if (coverData) {
                 console.log('KAPAK VERISI ALINDI!');
                 console.log('Veri uzunluğu:', coverData.length);
@@ -1749,7 +3717,7 @@ async function extractAlbumArt(filePath) {
     } catch (e) {
         console.error('HATA oluştu:', e);
     }
-    
+
     console.log('Varsayılan kapak kullanılacak');
     updateCoverArt(null, 'audio');
 }
@@ -1761,9 +3729,9 @@ function updateCoverArt(imageData, mediaType) {
         console.log('coverArt element bulunamadı');
         return;
     }
-    
+
     console.log('Cover güncelleniyor:', mediaType, imageData ? 'data var' : 'varsayılan');
-    
+
     if (imageData) {
         // Base64 resim verisi
         coverImg.src = imageData;
@@ -1779,13 +3747,16 @@ function updateCoverArt(imageData, mediaType) {
         }
         coverImg.classList.add('default-cover');
     }
-    
+
     state.currentCover = imageData;
+
+    // MPRIS metadata'yı güncelle (albüm kapağı değiştiğinde)
+    updateMPRISMetadata();
 }
 
 function togglePlayPause() {
     const activePlayer = getActiveAudioPlayer();
-    
+
     if (state.isPlaying) {
         // Duraklatma
         if (state.activeMedia === 'audio') {
@@ -1812,11 +3783,30 @@ function togglePlayPause() {
         } else if (state.activeMedia === 'video') {
             elements.videoPlayer.pause();
         }
+        // FIX: Web Pause handling added
+        else if (state.activeMedia === 'web' && elements.webView) {
+            elements.webView.executeJavaScript(`
+                    var m = document.querySelector('video, audio');
+                    if(m) m.pause();
+                `);
+        }
         state.isPlaying = false;
         updatePlayPauseIcon(false);
+        updateTrayState();
+        updateMPRISMetadata();
     } else {
-        // Oynatma - önce mevcut şarkı var mı kontrol et
-        if (state.currentIndex >= 0 && state.activeMedia === 'audio') {
+        // Oynatma
+        if (state.activeMedia === 'web' && elements.webView) {
+            // Web Play
+            elements.webView.executeJavaScript(`
+                var m = document.querySelector('video, audio');
+                if(m) m.play();
+            `);
+            state.isPlaying = true;
+            updatePlayPauseIcon(true);
+            updateTrayState();
+            updateMPRISMetadata();
+        } else if (state.currentIndex >= 0 && state.activeMedia === 'audio') {
             // Mevcut şarkıyı devam ettir
             if (useNativeAudio) {
                 if (state.settings?.playback?.fadeOnPauseResume && window.aurivo?.audio?.fadeVolumeTo) {
@@ -1838,13 +3828,17 @@ function togglePlayPause() {
             }
             state.isPlaying = true;
             updatePlayPauseIcon(true);
-        } else if (state.currentIndex === -1 && state.playlist.length > 0) {
+            updateTrayState();
+            updateMPRISMetadata();
+        } else if (state.activeMedia === 'audio' && state.currentIndex === -1 && state.playlist.length > 0) {
             // Hiç şarkı çalmıyorsa ilk şarkıyı başlat
             playIndex(0);
         } else if (state.activeMedia === 'video') {
             elements.videoPlayer.play();
             state.isPlaying = true;
             updatePlayPauseIcon(true);
+            updateTrayState();
+            updateMPRISMetadata();
         }
     }
 }
@@ -1853,13 +3847,13 @@ function togglePlayPause() {
 function fadeOutAndPause(player, duration) {
     const startVolume = player.volume;
     const startTime = performance.now();
-    
+
     function animate() {
         const elapsed = performance.now() - startTime;
         const progress = Math.min(elapsed / duration, 1);
-        
+
         player.volume = startVolume * (1 - progress);
-        
+
         if (progress < 1) {
             requestAnimationFrame(animate);
         } else {
@@ -1867,7 +3861,7 @@ function fadeOutAndPause(player, duration) {
             player.volume = startVolume; // Orijinal ses seviyesini geri yükle
         }
     }
-    
+
     requestAnimationFrame(animate);
 }
 
@@ -1876,20 +3870,20 @@ function fadeInAndPlay(player, duration) {
     const targetVolume = state.volume / 100;
     player.volume = 0;
     player.play();
-    
+
     const startTime = performance.now();
-    
+
     function animate() {
         const elapsed = performance.now() - startTime;
         const progress = Math.min(elapsed / duration, 1);
-        
+
         player.volume = targetVolume * progress;
-        
+
         if (progress < 1) {
             requestAnimationFrame(animate);
         }
     }
-    
+
     requestAnimationFrame(animate);
 }
 
@@ -1919,20 +3913,23 @@ function canCrossfadeNow() {
     if (useNativeAudio && state.activeMedia === 'audio') {
         return true;
     }
-    
+
     const activePlayer = getActiveAudioPlayer();
     const duration = activePlayer.duration * 1000;
-    
+
     // Parça çok kısa ise crossfade yapma
     if (duration > 0 && duration < state.settings.playback.crossfadeMs + 300) return false;
-    
+
     return true;
 }
 
 // Sonraki index'i hesapla
 function computeNextIndex() {
     if (state.playlist.length <= 0) return -1;
-    
+
+    // Eğer geçerli bir şarkı çalmıyorsa (örn: durduruldu), ilk şarkıdan başla
+    if (state.currentIndex < 0) return 0;
+
     if (state.isShuffle) {
         if (state.playlist.length <= 1) return state.currentIndex;
         let idx = Math.floor(Math.random() * state.playlist.length);
@@ -1941,7 +3938,7 @@ function computeNextIndex() {
         }
         return idx;
     }
-    
+
     let nextIdx = state.currentIndex + 1;
     if (nextIdx >= state.playlist.length) {
         return state.isRepeat ? 0 : -1;
@@ -1952,7 +3949,7 @@ function computeNextIndex() {
 // Önceki index'i hesapla
 function computePrevIndex() {
     if (state.playlist.length <= 0) return -1;
-    
+
     if (state.isShuffle) {
         if (state.playlist.length <= 1) return state.currentIndex;
         let idx = Math.floor(Math.random() * state.playlist.length);
@@ -1961,7 +3958,7 @@ function computePrevIndex() {
         }
         return idx;
     }
-    
+
     let prevIdx = state.currentIndex - 1;
     if (prevIdx < 0) {
         return state.isRepeat ? state.playlist.length - 1 : -1;
@@ -1986,47 +3983,47 @@ function startCrossfadeToIndex(index, ms) {
             });
         return;
     }
-    
+
     state.crossfadeInProgress = true;
     state.autoCrossfadeTriggered = false;
     state.trackAboutToEnd = false;
-    
+
     const oldPlayer = getActiveAudioPlayer();
     const oldVolume = oldPlayer.volume;
-    
+
     // Yeni player'a geç
     switchActivePlayer();
     const newPlayer = getActiveAudioPlayer();
-    
+
     // Yeni parçayı hazırla
     const item = state.playlist[index];
     const encodedPath = encodeURI('file://' + item.path).replace(/#/g, '%23');
-    
+
     newPlayer.src = encodedPath;
     newPlayer.volume = 0;
     newPlayer.play();
-    
+
     // UI'ı güncelle
     state.currentIndex = index;
     state.isPlaying = true;
     elements.nowPlayingLabel.textContent = 'Şu An Çalınan: ' + item.name;
     renderPlaylist();
     extractAlbumArt(item.path);
-    
+
     // Crossfade animasyonu
     const startTime = performance.now();
     const targetVolume = state.volume / 100;
-    
+
     function animateCrossfade() {
         const elapsed = performance.now() - startTime;
         const progress = Math.min(elapsed / ms, 1);
-        
+
         // Eski player fade out
         oldPlayer.volume = oldVolume * (1 - progress);
-        
+
         // Yeni player fade in
         newPlayer.volume = targetVolume * progress;
-        
+
         if (progress < 1) {
             requestAnimationFrame(animateCrossfade);
         } else {
@@ -2038,7 +4035,7 @@ function startCrossfadeToIndex(index, ms) {
             console.log('Crossfade tamamlandı');
         }
     }
-    
+
     requestAnimationFrame(animateCrossfade);
     console.log('Crossfade başlatıldı:', item.name);
 }
@@ -2047,46 +4044,54 @@ function startCrossfadeToIndex(index, ms) {
 function maybeStartAutoCrossfade() {
     // Native audio kullanıyorken HTML5 audio crossfade'i devre dışı
     if (useNativeAudio) return;
-    
+
     if (!state.settings?.playback?.crossfadeAutoEnabled) return;
     if (state.autoCrossfadeTriggered) return;
     if (!canCrossfadeNow()) return;
-    
+
     const activePlayer = getActiveAudioPlayer();
     const positionMs = activePlayer.currentTime * 1000;
     const durationMs = activePlayer.duration * 1000;
-    
+
     if (durationMs <= 0) return;
-    
+
     const remaining = durationMs - positionMs;
     if (remaining <= 0) return;
-    
+
     const crossfadeMs = state.settings.playback.crossfadeMs || 2000;
-    
+
     // Crossfade süresi kadar kala tetikle
     if (remaining > crossfadeMs) {
         state.trackAboutToEnd = false;
         return;
     }
-    
+
     if (!state.trackAboutToEnd) {
         state.trackAboutToEnd = true;
     }
-    
+
     const nextIdx = computeNextIndex();
     if (nextIdx < 0) return;
-    
+
     state.autoCrossfadeTriggered = true;
     startCrossfadeToIndex(nextIdx, crossfadeMs);
 }
 
 // Manuel crossfade ile sonraki parça
 function playNextWithCrossfade() {
+    if (state.activeMedia === 'web' && elements.webView) {
+        // Web Next (YouTube vb.)
+        elements.webView.executeJavaScript(`
+            var nextBtn = document.querySelector('.ytp-next-button') || document.querySelector('[aria-label="Next"]');
+            if (nextBtn) nextBtn.click();
+        `);
+        return;
+    }
     if (state.playlist.length === 0) return;
-    
+
     const nextIndex = computeNextIndex();
     if (nextIndex < 0) return;
-    
+
     // Elle çapraz geçiş aktif mi?
     if (state.settings?.playback?.crossfadeManualEnabled && canCrossfadeNow()) {
         const crossfadeMs = state.settings.playback.crossfadeMs || 2000;
@@ -2098,11 +4103,20 @@ function playNextWithCrossfade() {
 
 // Manuel crossfade ile önceki parça
 function playPreviousWithCrossfade() {
+    if (state.activeMedia === 'web' && elements.webView) {
+        // Web Prev (YouTube vb.)
+        elements.webView.executeJavaScript(`
+            var prevBtn = document.querySelector('.ytp-prev-button') || document.querySelector('[aria-label="Previous"]');
+            if (prevBtn) prevBtn.click();
+            else window.history.back();
+        `);
+        return;
+    }
     if (state.playlist.length === 0) return;
-    
+
     const prevIndex = computePrevIndex();
     if (prevIndex < 0) return;
-    
+
     // Elle çapraz geçiş aktif mi?
     if (state.settings?.playback?.crossfadeManualEnabled && canCrossfadeNow()) {
         const crossfadeMs = state.settings.playback.crossfadeMs || 2000;
@@ -2114,8 +4128,15 @@ function playPreviousWithCrossfade() {
 
 // Eski playNext fonksiyonu (dahili kullanım için)
 function playNext() {
+    // Video modunda sıradaki videoyu çal
+    if (state.activeMedia === 'video') {
+        playNextVideo();
+        return;
+    }
+
+    // Müzik modunda sıradaki şarkıyı çal
     if (state.playlist.length === 0) return;
-    
+
     let nextIndex;
     if (state.isShuffle) {
         nextIndex = Math.floor(Math.random() * state.playlist.length);
@@ -2126,8 +4147,15 @@ function playNext() {
 }
 
 function playPrevious() {
+    // Video modunda önceki videoyu çal
+    if (state.activeMedia === 'video') {
+        playPreviousVideo();
+        return;
+    }
+
+    // Müzik modunda önceki şarkıyı çal
     if (state.playlist.length === 0) return;
-    
+
     let prevIndex;
     if (state.isShuffle) {
         prevIndex = Math.floor(Math.random() * state.playlist.length);
@@ -2139,35 +4167,54 @@ function playPrevious() {
 }
 
 function handleTrackEnded() {
+    console.log('[PLAYBACK] Track ended. Current:', state.currentIndex, 'Total:', state.playlist.length);
+
     // Eğer otomatik crossfade zaten tetiklendiyse, bir şey yapma
     if (state.autoCrossfadeTriggered || state.crossfadeInProgress) {
         return;
     }
-    
+
+    // Stop after current aktifse, çalmayı durdur
+    if (state.stopAfterCurrent) {
+        state.stopAfterCurrent = false; // Tek seferlik
+        state.isPlaying = false;
+        updatePlayPauseIcon(false);
+        updateTrayState();
+        return;
+    }
+
     if (state.isRepeat) {
         playIndex(state.currentIndex);
     } else {
         // Otomatik crossfade aktifse ve sonraki parça varsa
         const nextIdx = computeNextIndex();
+        console.log('[PLAYBACK] Next index:', nextIdx);
         if (nextIdx >= 0 && state.settings?.playback?.crossfadeAutoEnabled) {
             startCrossfadeToIndex(nextIdx, state.settings.playback.crossfadeMs || 2000);
         } else if (nextIdx >= 0) {
             playIndex(nextIdx);
         } else {
             // Liste bitti
+            console.log('[PLAYBACK] Playlist finished');
             state.isPlaying = false;
             updatePlayPauseIcon(false);
+            updateTrayState();
         }
     }
 }
 
 function seekBy(seconds) {
-    if (useNativeAudio && state.activeMedia === 'audio') {
+    if (state.activeMedia === 'video') {
+        // Video için seek
+        const video = elements.videoPlayer;
+        video.currentTime = Math.max(0, Math.min(video.duration || 0, video.currentTime + seconds));
+    } else if (useNativeAudio && state.activeMedia === 'audio') {
         // C++ Engine ile seek
         window.aurivo.audio.getPosition().then(pos => {
             window.aurivo.audio.seek(pos + seconds * 1000);
         });
     } else {
+        // HTML5 Audio için seek
         const activePlayer = getActiveAudioPlayer();
         activePlayer.currentTime += seconds;
     }
@@ -2175,13 +4222,18 @@ function seekBy(seconds) {
 
 async function handleSeek() {
     const value = elements.seekSlider.value;
-    
-    if (useNativeAudio && state.activeMedia === 'audio') {
+
+    if (state.activeMedia === 'video') {
+        // Video için seek
+        const duration = elements.videoPlayer.duration || 0;
+        elements.videoPlayer.currentTime = (value / 1000) * duration;
+    } else if (useNativeAudio && state.activeMedia === 'audio') {
         // C++ Engine ile seek
         const duration = await window.aurivo.audio.getDuration();
         const newPos = (value / 1000) * duration;
         await window.aurivo.audio.seek(newPos);
     } else {
+        // HTML5 Audio için seek
         const activePlayer = getActiveAudioPlayer();
         const duration = activePlayer.duration || 0;
         activePlayer.currentTime = (value / 1000) * duration;
@@ -2193,8 +4245,17 @@ async function handleSeekClick(e) {
     const rect = elements.seekSlider.getBoundingClientRect();
     const clickX = e.clientX - rect.left;
     const percent = clickX / rect.width;
-    
-    if (useNativeAudio && state.activeMedia === 'audio') {
+
+    if (state.activeMedia === 'video') {
+        // Video için seek
+        const duration = elements.videoPlayer.duration || 0;
+        if (duration > 0) {
+            const newTime = percent * duration;
+            elements.videoPlayer.currentTime = newTime;
+            elements.seekSlider.value = percent * 1000;
+            updateRainbowSlider(elements.seekSlider, percent * 100);
+        }
+    } else if (useNativeAudio && state.activeMedia === 'audio') {
         // C++ Engine ile seek - getDuration saniye dönüdürüyor, seek milisaniye bekliyor
         const durationSec = await window.aurivo.audio.getDuration();
         if (durationSec > 0) {
@@ -2204,9 +4265,10 @@ async function handleSeekClick(e) {
             updateRainbowSlider(elements.seekSlider, percent * 100);
         }
     } else {
+        // HTML5 Audio için seek
         const activePlayer = getActiveAudioPlayer();
         const duration = activePlayer.duration || 0;
-        
+
         if (duration > 0) {
             const newTime = percent * duration;
             activePlayer.currentTime = newTime;
@@ -2217,20 +4279,40 @@ async function handleSeekClick(e) {
 }
 
 function updateTimeDisplay() {
-    // HTML5 Audio için (native modda startNativePositionUpdates kullanılır)
-    if (useNativeAudio && state.activeMedia === 'audio') return;
-    
-    const activePlayer = getActiveAudioPlayer();
-    const current = activePlayer.currentTime;
-    const duration = activePlayer.duration || 0;
-    
+    let current = 0;
+    let duration = 0;
+
+    if (state.activeMedia === 'video') {
+        // Video için
+        const video = elements.videoPlayer;
+        current = video.currentTime || 0;
+        duration = video.duration || 0;
+    } else if (useNativeAudio && state.activeMedia === 'audio') {
+        // Native audio için - startNativePositionUpdates kullanılır
+        return;
+    } else {
+        // HTML5 Audio için
+        const activePlayer = getActiveAudioPlayer();
+        current = activePlayer.currentTime;
+        duration = activePlayer.duration || 0;
+    }
+
     elements.currentTime.textContent = formatTime(current);
-    
+
     if (duration > 0) {
         const progress = (current / duration) * 1000;
         elements.seekSlider.value = progress;
         // Rainbow slider efektini güncelle
         updateRainbowSlider(elements.seekSlider, progress / 10);
+        // Bitiş saatini güncelle
+        elements.durationTime.textContent = formatTime(duration);
+    }
+
+    // MPRIS position'ı güncelle (her 2 saniyede bir)
+    const currentSecInt = Math.floor(current);
+    if (currentSecInt !== state.lastMPRISPosition && currentSecInt % 2 === 0) {
+        state.lastMPRISPosition = currentSecInt;
+        updateMPRISMetadata();
     }
 }
 
@@ -2254,49 +4336,84 @@ function handleVolumeChange() {
     const value = parseInt(elements.volumeSlider.value);
     state.volume = value;
     state.isMuted = false;
-    
+
     // C++ Audio Engine kullanılıyorsa (0-100 arası değer bekliyor)
     if (useNativeAudio && state.activeMedia === 'audio') {
         window.aurivo.audio.setVolume(value / 100); // 0-1 arası
     }
-    
+
     // HTML5 Audio/Video için de güncelle (0-1 arası bekliyor)
     const activePlayer = getActiveAudioPlayer();
     if (!state.crossfadeInProgress) {
         activePlayer.volume = value / 100;
     }
     elements.videoPlayer.volume = value / 100;
+    elements.videoPlayer.muted = false;
+    if (elements.audio) elements.audio.muted = false;
     elements.volumeLabel.textContent = value + '%';
+
+    // Tam ekran ses slider'ını da senkronize et
+    const fsVolumeSlider = document.getElementById('fsVolumeSlider');
+    const fsVolumeLabel = document.getElementById('fsVolumeLabel');
+    if (fsVolumeSlider) {
+        fsVolumeSlider.value = value;
+    }
+    if (fsVolumeLabel) {
+        fsVolumeLabel.textContent = value + '%';
+    }
+
     updateVolumeIcon();
     // Rainbow slider efektini güncelle
     updateRainbowSlider(elements.volumeSlider, value);
+    updateFsVolumeIcon();
     saveSettings();
 }
 
 function toggleMute() {
+    const fsVolumeSlider = document.getElementById('fsVolumeSlider');
+    const fsVolumeLabel = document.getElementById('fsVolumeLabel');
+
     if (state.isMuted) {
         state.isMuted = false;
         elements.volumeSlider.value = state.savedVolume;
         state.volume = state.savedVolume;
-        
+
         if (useNativeAudio) {
             window.aurivo.audio.setVolume(state.savedVolume / 100); // 0-1
         }
         elements.audio.volume = state.savedVolume / 100;
+        elements.videoPlayer.volume = state.savedVolume / 100;
+        elements.videoPlayer.muted = false;
+        if (elements.audio) elements.audio.muted = false;
         elements.volumeLabel.textContent = state.savedVolume + '%';
+
+        // Tam ekran kontrollerini güncelle
+        if (fsVolumeSlider) fsVolumeSlider.value = state.savedVolume;
+        if (fsVolumeLabel) fsVolumeLabel.textContent = state.savedVolume + '%';
     } else {
         state.isMuted = true;
         state.savedVolume = state.volume;
         elements.volumeSlider.value = 0;
         state.volume = 0;
-        
+
         if (useNativeAudio) {
             window.aurivo.audio.setVolume(0);
         }
         elements.audio.volume = 0;
+        elements.videoPlayer.volume = 0;
+        elements.videoPlayer.muted = true;
+        if (elements.audio) elements.audio.muted = true;
         elements.volumeLabel.textContent = '0%';
+
+        // Tam ekran kontrollerini güncelle
+        if (fsVolumeSlider) fsVolumeSlider.value = 0;
+        if (fsVolumeLabel) fsVolumeLabel.textContent = '0%';
     }
+    updateRainbowSlider(elements.volumeSlider, state.volume);
     updateVolumeIcon();
+    updateTrayState();
+    updateFsVolumeIcon();
+    saveSettings();
 }
 
 function updateVolumeIcon() {
@@ -2309,7 +4426,7 @@ function handleVolumeClick(e) {
     const clickX = e.clientX - rect.left;
     const percent = Math.round((clickX / rect.width) * 100);
     const newValue = Math.max(0, Math.min(100, percent));
-    
+
     elements.volumeSlider.value = newValue;
     handleVolumeChange();
 }
@@ -2319,9 +4436,544 @@ function handleVolumeWheel(e) {
     e.preventDefault();
     const delta = e.deltaY < 0 ? 5 : -5; // Yukarı = artır, aşağı = azalt
     const newValue = Math.max(0, Math.min(100, parseInt(state.volume) + delta));
-    
+
     elements.volumeSlider.value = newValue;
     handleVolumeChange();
+}
+
+function safeNotify(message, type = 'info', timeoutMs = 3000) {
+    try {
+        if (typeof showNotification === 'function') {
+            showNotification(message, type, timeoutMs);
+            return;
+        }
+    } catch { }
+    console.log(`[${type}] ${message}`);
+}
+
+function isProbablyHttpUrl(value) {
+    const s = String(value || '').trim();
+    if (!s) return false;
+    return /^https?:\/\//i.test(s);
+}
+
+function normalizeWebTitle(rawTitle) {
+    const t = String(rawTitle || '').trim();
+    if (!t) return '';
+    return t
+        .replace(/\s+-\s+YouTube\s*$/i, '')
+        .replace(/\s+-\s+YouTube\s+Music\s*$/i, '')
+        .trim();
+}
+
+function isGenericTitle(title) {
+    const t = String(title || '').trim().toLowerCase();
+    if (!t) return true;
+    return (
+        t === 'youtube' ||
+        t === 'youtube music' ||
+        t === 'aurivo player - hazır' ||
+        t === 'aurivo player' ||
+        t.startsWith('şu an çalınan:') && (t === 'şu an çalınan: aurivo player - hazır')
+    );
+}
+
+async function getWebViewDocumentTitleSafe() {
+    try {
+        if (!elements.webView || typeof elements.webView.executeJavaScript !== 'function') return '';
+        // Some pages may block; executeJavaScript still works within webview context.
+        const title = await elements.webView.executeJavaScript('document.title', true);
+        return normalizeWebTitle(title);
+    } catch {
+        return '';
+    }
+}
+
+async function getClipboardTextSafe() {
+    try {
+        if (window.aurivo?.clipboard?.getText) {
+            return String(await window.aurivo.clipboard.getText() || '');
+        }
+    } catch { }
+    try {
+        if (navigator.clipboard?.readText) {
+            return String(await navigator.clipboard.readText() || '');
+        }
+    } catch { }
+    return '';
+}
+
+async function prefillDownloadFields() {
+    // Default folder: Downloads
+    try {
+        const prefDir = String(state?.settings?.download?.downloadDir || '').trim();
+        if (elements.downloadFolder && prefDir) {
+            elements.downloadFolder.value = prefDir;
+        } else if (elements.downloadFolder && !elements.downloadFolder.value && window.aurivo?.getSpecialPaths) {
+            const paths = await window.aurivo.getSpecialPaths();
+            if (paths?.downloads) elements.downloadFolder.value = paths.downloads;
+        }
+    } catch { }
+
+    // Apply saved download preferences into modal controls
+    try {
+        const dl = state?.settings?.download || {};
+        if (elements.downloadVideoQuality && dl.preferredVideoQuality) elements.downloadVideoQuality.value = dl.preferredVideoQuality;
+        if (elements.downloadVideoCodec && dl.preferredVideoCodec !== undefined) elements.downloadVideoCodec.value = dl.preferredVideoCodec || '';
+        if (elements.downloadAudioFormat && dl.preferredAudioFormat) elements.downloadAudioFormat.value = dl.preferredAudioFormat;
+        if (elements.downloadAudioQuality && dl.preferredAudioQuality) elements.downloadAudioQuality.value = dl.preferredAudioQuality;
+        if (elements.downloadNormalizeAudio) elements.downloadNormalizeAudio.checked = dl.normalizeAudio !== false;
+
+        if (elements.downloadCookiesBrowser) elements.downloadCookiesBrowser.value = dl.cookiesFromBrowser || '';
+        if (elements.downloadCookiesFile) elements.downloadCookiesFile.value = dl.cookiesFile || '';
+        if (elements.downloadProxy) elements.downloadProxy.value = dl.proxy || '';
+
+        if (elements.downloadUseConfig) elements.downloadUseConfig.checked = Boolean(dl.useConfig);
+        if (elements.downloadConfigFile) elements.downloadConfigFile.value = dl.configFile || '';
+        if (elements.downloadConfigRow && elements.downloadUseConfig) {
+            elements.downloadConfigRow.classList.toggle('hidden', !elements.downloadUseConfig.checked);
+        }
+
+        if (elements.downloadShowMoreFormats) elements.downloadShowMoreFormats.checked = Boolean(dl.showMoreFormats);
+        if (elements.downloadFormatOverride) elements.downloadFormatOverride.value = dl.formatOverride || '';
+        if (elements.downloadFormatOverride && elements.downloadShowMoreFormats) {
+            elements.downloadFormatOverride.classList.toggle('hidden', !elements.downloadShowMoreFormats.checked);
+        }
+
+        if (elements.downloadPlaylist) elements.downloadPlaylist.checked = Boolean(dl.playlist);
+        if (elements.downloadPlaylistFilenameFormat) elements.downloadPlaylistFilenameFormat.value = dl.playlistFilenameFormat || '%(playlist_index)s.%(title)s.%(ext)s';
+        if (elements.downloadPlaylistFoldernameFormat) elements.downloadPlaylistFoldernameFormat.value = dl.playlistFoldernameFormat || '%(playlist_title)s';
+        if (elements.downloadPlaylistFormats && elements.downloadPlaylist) {
+            elements.downloadPlaylistFormats.classList.toggle('hidden', !elements.downloadPlaylist.checked);
+        }
+
+        if (elements.downloadCustomArgs) elements.downloadCustomArgs.value = dl.customArgs || '';
+    } catch { }
+
+    // URL: prefer WebView current URL; fallback clipboard
+    try {
+        const currentUrl = (elements.webView && typeof elements.webView.getURL === 'function')
+            ? elements.webView.getURL()
+            : '';
+        if (elements.downloadUrl && isProbablyHttpUrl(currentUrl)) {
+            elements.downloadUrl.value = currentUrl;
+        }
+    } catch { }
+
+    const clip = await getClipboardTextSafe();
+    if (elements.downloadUrl && isProbablyHttpUrl(clip)) {
+        elements.downloadUrl.value = clip.trim();
+    }
+
+    // Title (optional UI field)
+    try {
+        if (elements.downloadTitle && (!elements.downloadTitle.value || isGenericTitle(elements.downloadTitle.value))) {
+            // 1) Web metadata title (when playing)
+            const fromWebMeta = normalizeWebTitle(state?.webTitle || '');
+            if (fromWebMeta && !isGenericTitle(fromWebMeta)) {
+                elements.downloadTitle.value = fromWebMeta;
+                return;
+            }
+
+            // 2) Now playing label
+            const label = String(elements.nowPlayingLabel?.textContent || '').trim();
+            const prefix = 'Şu An Çalınan:';
+            if (label.startsWith(prefix)) {
+                const t = normalizeWebTitle(label.slice(prefix.length).trim());
+                if (t && !isGenericTitle(t)) {
+                    elements.downloadTitle.value = t;
+                    return;
+                }
+            }
+
+            // 3) Document title from webview (works even if not playing)
+            const docTitle = await getWebViewDocumentTitleSafe();
+            if (docTitle && !isGenericTitle(docTitle)) {
+                elements.downloadTitle.value = docTitle;
+                return;
+            }
+
+            // Fallback
+            elements.downloadTitle.value = '';
+        }
+    } catch { }
+}
+
+function setDownloadMode(mode) {
+    downloadState.mode = mode === 'audio' ? 'audio' : 'video';
+    if (elements.downloadTabVideo && elements.downloadTabAudio) {
+        elements.downloadTabVideo.classList.toggle('active', downloadState.mode === 'video');
+        elements.downloadTabAudio.classList.toggle('active', downloadState.mode === 'audio');
+    }
+    if (elements.downloadOptionsVideo && elements.downloadOptionsAudio) {
+        elements.downloadOptionsVideo.classList.toggle('hidden', downloadState.mode !== 'video');
+        elements.downloadOptionsAudio.classList.toggle('hidden', downloadState.mode !== 'audio');
+    }
+    if (elements.downloadCardModeTitle) {
+        elements.downloadCardModeTitle.textContent = downloadState.mode === 'video' ? 'Video İndir' : 'Sesi çıkart';
+    }
+
+    // Advanced rows that are mode-specific
+    if (elements.downloadVideoCodecRow) {
+        elements.downloadVideoCodecRow.classList.toggle('hidden', downloadState.mode !== 'video');
+    }
+}
+
+function resetDownloadProgressUI() {
+    if (elements.downloadProgressBox) elements.downloadProgressBox.classList.add('hidden');
+    if (elements.downloadProgressLabel) elements.downloadProgressLabel.textContent = 'Hazır';
+    if (elements.downloadProgressPercent) elements.downloadProgressPercent.textContent = '0%';
+    if (elements.downloadProgressFill) elements.downloadProgressFill.style.width = '0%';
+    if (elements.downloadCancelActiveBtn) elements.downloadCancelActiveBtn.classList.add('hidden');
+    if (elements.downloadDetailsBtn) elements.downloadDetailsBtn.classList.add('hidden');
+    if (elements.downloadDetails) {
+        elements.downloadDetails.classList.add('hidden');
+        elements.downloadDetails.textContent = '';
+    }
+}
+
+function setDownloadRunningUI(isRunning) {
+    downloadState.isRunning = Boolean(isRunning);
+    if (elements.downloadStartBtn) elements.downloadStartBtn.classList.toggle('hidden', downloadState.isRunning);
+    if (elements.downloadStopBtn) elements.downloadStopBtn.classList.toggle('hidden', !downloadState.isRunning);
+    if (elements.downloadMoreBtn) elements.downloadMoreBtn.classList.toggle('hidden', downloadState.isRunning);
+    if (elements.downloadCancelBtn) elements.downloadCancelBtn.textContent = downloadState.isRunning ? 'Gizle' : 'Kapat';
+    if (elements.downloadCancelActiveBtn) elements.downloadCancelActiveBtn.classList.toggle('hidden', !downloadState.isRunning);
+    if (downloadState.isRunning) setDownloadView('basic');
+}
+
+async function openDownloadModal() {
+    if (!elements.downloadPage) return;
+    hideUtilityPage(elements.settingsPage, elements.settingsBtn);
+    hideUtilityPage(elements.securityPage, elements.securityBtn);
+    showUtilityPage(elements.downloadPage, elements.downloadBtn);
+    setDownloadMode(downloadState.mode);
+    setDownloadView('basic');
+    if (!downloadState.isRunning) resetDownloadProgressUI();
+    await prefillDownloadFields();
+}
+
+function closeDownloadModal(force = false) {
+    if (!elements.downloadPage) return;
+    if (downloadState.isRunning && !force) {
+        // İndirme sürerken pencereyi sadece gizle
+        hideUtilityPage(elements.downloadPage, elements.downloadBtn);
+        return;
+    }
+    hideUtilityPage(elements.downloadPage, elements.downloadBtn);
+}
+
+function appendDownloadLogLine(line) {
+    // Log UI is intentionally hidden; keep stdout parsing for percent only.
+    void line;
+}
+
+function setupDownloadModalEvents() {
+    if (!elements.downloadPage) return;
+
+    if (elements.closeDownload) elements.closeDownload.addEventListener('click', () => closeDownloadModal(false));
+    if (elements.downloadCancelBtn) elements.downloadCancelBtn.addEventListener('click', () => closeDownloadModal(false));
+
+    if (elements.downloadTabVideo) elements.downloadTabVideo.addEventListener('click', () => setDownloadMode('video'));
+    if (elements.downloadTabAudio) elements.downloadTabAudio.addEventListener('click', () => setDownloadMode('audio'));
+
+    if (elements.downloadMoreBtn) {
+        elements.downloadMoreBtn.addEventListener('click', () => {
+            setDownloadView('advanced');
+        });
+    }
+
+    if (elements.downloadViewBackBtn) {
+        elements.downloadViewBackBtn.addEventListener('click', () => setDownloadView('basic'));
+    }
+
+    if (elements.downloadUseConfig) {
+        const sync = () => {
+            if (elements.downloadConfigRow) {
+                elements.downloadConfigRow.classList.toggle('hidden', !elements.downloadUseConfig.checked);
+            }
+        };
+        elements.downloadUseConfig.addEventListener('change', sync);
+        sync();
+    }
+
+    if (elements.downloadShowMoreFormats && elements.downloadFormatOverride) {
+        const sync = () => {
+            elements.downloadFormatOverride.classList.toggle('hidden', !elements.downloadShowMoreFormats.checked);
+        };
+        elements.downloadShowMoreFormats.addEventListener('change', sync);
+        sync();
+    }
+
+    if (elements.downloadPlaylist) {
+        const sync = () => {
+            if (elements.downloadPlaylistFormats) {
+                elements.downloadPlaylistFormats.classList.toggle('hidden', !elements.downloadPlaylist.checked);
+            }
+        };
+        elements.downloadPlaylist.addEventListener('change', sync);
+        sync();
+    }
+
+    if (elements.downloadBrowseCookiesFile) {
+        elements.downloadBrowseCookiesFile.addEventListener('click', async () => {
+            try {
+                const res = await window.aurivo?.openFile?.();
+                const fp = Array.isArray(res) ? res[0] : null;
+                if (fp && elements.downloadCookiesFile) elements.downloadCookiesFile.value = fp;
+            } catch (e) {
+                safeNotify('Cookies dosyası seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadBrowseConfigFile) {
+        elements.downloadBrowseConfigFile.addEventListener('click', async () => {
+            try {
+                const res = await window.aurivo?.openFile?.();
+                const fp = Array.isArray(res) ? res[0] : null;
+                if (fp && elements.downloadConfigFile) elements.downloadConfigFile.value = fp;
+            } catch (e) {
+                safeNotify('Config dosyası seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadPasteUrl) {
+        elements.downloadPasteUrl.addEventListener('click', async () => {
+            const clip = await getClipboardTextSafe();
+            if (elements.downloadUrl && clip) elements.downloadUrl.value = clip.trim();
+        });
+    }
+
+    if (elements.downloadDetailsBtn) {
+        elements.downloadDetailsBtn.addEventListener('click', () => {
+            if (!elements.downloadDetails) return;
+            elements.downloadDetails.classList.toggle('hidden');
+        });
+    }
+
+    if (elements.downloadBrowseFolder) {
+        elements.downloadBrowseFolder.addEventListener('click', async () => {
+            try {
+                const result = await window.aurivo?.dialog?.openFolder?.();
+                if (result?.path) elements.downloadFolder.value = result.path;
+            } catch (e) {
+                safeNotify('Klasör seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadStartBtn) {
+        elements.downloadStartBtn.addEventListener('click', startDownloadFromModal);
+    }
+
+    if (elements.downloadStopBtn) {
+        elements.downloadStopBtn.addEventListener('click', async () => {
+            if (!downloadState.activeId) return;
+            try {
+                await window.aurivo?.download?.cancel?.(downloadState.activeId);
+            } catch (e) {
+                safeNotify('İndirme durdurulamadı: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.downloadCancelActiveBtn) {
+        elements.downloadCancelActiveBtn.addEventListener('click', async () => {
+            if (!downloadState.activeId) return;
+            try {
+                await window.aurivo?.download?.cancel?.(downloadState.activeId);
+            } catch (e) {
+                safeNotify('İndirme iptal edilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    // Full-page utility view: no drag behavior (avoid "window inside window" look)
+}
+
+function setDownloadView(view) {
+    const v = view === 'advanced' ? 'advanced' : 'basic';
+    if (elements.downloadPageBasic) elements.downloadPageBasic.classList.toggle('hidden', v !== 'basic');
+    if (elements.downloadPageAdvanced) elements.downloadPageAdvanced.classList.toggle('hidden', v !== 'advanced');
+    if (elements.downloadViewBackBtn) elements.downloadViewBackBtn.classList.toggle('hidden', v !== 'advanced');
+    if (elements.downloadViewTitle) elements.downloadViewTitle.textContent = v === 'advanced' ? 'Gelişmiş' : 'Basit';
+}
+
+function setupDownloadModalDrag() {
+    const content = document.querySelector('#downloadPage .download-modal-content');
+    const header = document.querySelector('#downloadPage .modal-header');
+    if (!content || !header) return;
+    if (header.dataset.dragInstalled === '1') return;
+    header.dataset.dragInstalled = '1';
+
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    const onMouseMove = (e) => {
+        if (!dragging) return;
+        const container = elements.downloadPage;
+        const containerRect = container?.getBoundingClientRect?.();
+        if (!containerRect) return;
+        const rect = content.getBoundingClientRect();
+        const w = rect.width;
+        const h = rect.height;
+
+        const maxX = Math.max(0, containerRect.width - w);
+        const maxY = Math.max(0, containerRect.height - h);
+
+        const x = Math.min(maxX, Math.max(0, (e.clientX - containerRect.left) - offsetX));
+        const y = Math.min(maxY, Math.max(0, (e.clientY - containerRect.top) - offsetY));
+
+        content.style.left = `${x}px`;
+        content.style.top = `${y}px`;
+        content.style.transform = 'none';
+    };
+
+    const stop = () => {
+        dragging = false;
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', stop);
+    };
+
+    header.addEventListener('mousedown', (e) => {
+        const t = e.target;
+        if (t && (t.closest?.('#closeDownload') || t.closest?.('.modal-close'))) return;
+        dragging = true;
+
+        const container = elements.downloadPage;
+        const containerRect = container?.getBoundingClientRect?.();
+        if (!containerRect) return;
+
+        const rect = content.getBoundingClientRect();
+        content.style.position = 'absolute';
+        content.style.left = `${rect.left - containerRect.left}px`;
+        content.style.top = `${rect.top - containerRect.top}px`;
+        content.style.transform = 'none';
+
+        offsetX = e.clientX - rect.left;
+        offsetY = e.clientY - rect.top;
+
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', stop);
+    });
+}
+
+async function startDownloadFromModal() {
+    if (!window.aurivo?.download?.start) {
+        safeNotify('İndirme API bulunamadı (window.aurivo.download.start)', 'error');
+        return;
+    }
+
+    const url = String(elements.downloadUrl?.value || '').trim();
+    if (!url) {
+        safeNotify('Lütfen bir URL girin.', 'warning');
+        return;
+    }
+
+    // Kullanıcı her indirmede klasör seçsin
+    let outputDir = '';
+    try {
+        const prefDir = String(state?.settings?.download?.downloadDir || '').trim();
+        const result = await window.aurivo?.dialog?.openFolder?.({
+            title: 'İndirme Klasörü Seç',
+            defaultPath: prefDir || undefined
+        });
+        if (!result?.path) {
+            safeNotify('İndirme klasörü seçilmedi.', 'warning');
+            return;
+        }
+        outputDir = result.path;
+        if (elements.downloadFolder) elements.downloadFolder.value = outputDir;
+    } catch (e) {
+        safeNotify('Klasör seçilemedi: ' + (e?.message || e), 'error');
+        return;
+    }
+
+    const payload = {
+        url,
+        mode: downloadState.mode,
+        outputDir: outputDir || undefined,
+        videoHeight: downloadState.mode === 'video' ? String(elements.downloadVideoQuality?.value || 'auto') : undefined,
+        videoCodec: downloadState.mode === 'video' ? String(elements.downloadVideoCodec?.value || '') : undefined,
+        audioFormat: downloadState.mode === 'audio' ? String(elements.downloadAudioFormat?.value || 'mp3') : undefined,
+        audioQuality: downloadState.mode === 'audio' ? String(elements.downloadAudioQuality?.value || '192') : undefined,
+        normalizeAudio: downloadState.mode === 'audio' ? Boolean(elements.downloadNormalizeAudio?.checked) : undefined,
+        cookiesFromBrowser: String(elements.downloadCookiesBrowser?.value || ''),
+        cookiesFile: String(elements.downloadCookiesFile?.value || ''),
+        proxy: String(elements.downloadProxy?.value || ''),
+        useConfig: Boolean(elements.downloadUseConfig?.checked),
+        configFile: String(elements.downloadConfigFile?.value || ''),
+        showMoreFormats: Boolean(elements.downloadShowMoreFormats?.checked),
+        formatOverride: String(elements.downloadFormatOverride?.value || ''),
+        playlist: Boolean(elements.downloadPlaylist?.checked),
+        playlistFilenameFormat: String(elements.downloadPlaylistFilenameFormat?.value || ''),
+        playlistFoldernameFormat: String(elements.downloadPlaylistFoldernameFormat?.value || ''),
+        customArgs: String(elements.downloadCustomArgs?.value || '')
+    };
+
+    resetDownloadProgressUI();
+    if (elements.downloadProgressBox) elements.downloadProgressBox.classList.remove('hidden');
+    if (elements.downloadProgressLabel) elements.downloadProgressLabel.textContent = 'Başlatılıyor...';
+    setDownloadRunningUI(true);
+
+    try {
+        const res = await window.aurivo.download.start(payload);
+        downloadState.activeId = res?.id ?? null;
+        if (!downloadState.activeId) throw new Error('Download id alınamadı');
+        if (elements.downloadProgressLabel) elements.downloadProgressLabel.textContent = 'İndiriliyor...';
+    } catch (e) {
+        setDownloadRunningUI(false);
+        safeNotify('İndirme başlatılamadı: ' + (e?.message || e), 'error');
+    }
+}
+
+function setupDownloadIPC() {
+    if (downloadState.listenersInstalled) return;
+    if (!window.aurivo?.download?.onLog || !window.aurivo?.download?.onProgress || !window.aurivo?.download?.onDone) return;
+
+    downloadState.listenersInstalled = true;
+
+    window.aurivo.download.onLog((payload) => {
+        if (!payload || payload.id !== downloadState.activeId) return;
+        if (payload.line) appendDownloadLogLine(payload.line);
+    });
+
+    window.aurivo.download.onProgress((payload) => {
+        if (!payload || payload.id !== downloadState.activeId) return;
+        const percent = Math.max(0, Math.min(100, Number(payload.percent)));
+        if (Number.isFinite(percent)) {
+            if (elements.downloadProgressPercent) elements.downloadProgressPercent.textContent = `${percent}%`;
+            if (elements.downloadProgressFill) elements.downloadProgressFill.style.width = `${percent}%`;
+        }
+    });
+
+    window.aurivo.download.onDone((payload) => {
+        if (!payload || payload.id !== downloadState.activeId) return;
+        setDownloadRunningUI(false);
+        const ok = Boolean(payload.success);
+        if (elements.downloadProgressLabel) {
+            elements.downloadProgressLabel.textContent = ok ? 'İndirme tamamlandı' : 'İndirme hatası';
+        }
+        if (!ok) {
+            const msg = String(payload.message || payload.code || '').trim();
+            if (msg && elements.downloadProgressLabel) elements.downloadProgressLabel.textContent = 'İndirme hatası';
+            if (elements.downloadDetails && Array.isArray(payload.tail) && payload.tail.length) {
+                elements.downloadDetails.textContent = payload.tail.join('\n');
+                if (elements.downloadDetailsBtn) elements.downloadDetailsBtn.classList.remove('hidden');
+            } else if (elements.downloadDetails && msg) {
+                elements.downloadDetails.textContent = msg;
+                if (elements.downloadDetailsBtn) elements.downloadDetailsBtn.classList.remove('hidden');
+            }
+        }
+        if (ok) {
+            if (elements.downloadProgressPercent) elements.downloadProgressPercent.textContent = '100%';
+            if (elements.downloadProgressFill) elements.downloadProgressFill.style.width = '100%';
+        }
+        downloadState.activeId = null;
+    });
 }
 
 // ============================================
@@ -2343,25 +4995,28 @@ function toggleRepeat() {
 // SETTINGS MODAL
 // ============================================
 function openSettings() {
-    elements.settingsModal.classList.remove('hidden');
+    if (!elements.settingsPage) return;
+    closeDownloadModal(false);
+    hideUtilityPage(elements.securityPage, elements.securityBtn);
+    showUtilityPage(elements.settingsPage, elements.settingsBtn);
     loadSettingsToUI();
 }
 
 function closeSettings() {
-    elements.settingsModal.classList.add('hidden');
+    hideUtilityPage(elements.settingsPage, elements.settingsBtn);
 }
 
 function switchSettingsTab(tab) {
     const tabName = tab.dataset.tab;
-    
+
     elements.settingsTabs.forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
-    
+
     elements.settingsPages.forEach(p => {
         p.classList.add('hidden');
         p.classList.remove('active');
     });
-    
+
     const targetPage = document.getElementById(tabName + 'Settings');
     if (targetPage) {
         targetPage.classList.remove('hidden');
@@ -2372,7 +5027,7 @@ function switchSettingsTab(tab) {
 function loadSettingsToUI() {
     if (!state.settings) return;
     const pb = state.settings.playback;
-    
+
     document.getElementById('crossfadeStop').checked = pb.crossfadeStopEnabled;
     document.getElementById('crossfadeManual').checked = pb.crossfadeManualEnabled;
     document.getElementById('crossfadeAuto').checked = pb.crossfadeAutoEnabled;
@@ -2381,11 +5036,42 @@ function loadSettingsToUI() {
     document.getElementById('crossfadeMs').value = pb.crossfadeMs;
     document.getElementById('fadeOnPause').checked = pb.fadeOnPauseResume;
     document.getElementById('pauseFadeMs').value = pb.pauseFadeMs;
+
+    // Download prefs
+    const dl = state.settings.download || {};
+    if (elements.downloadPrefDirPath) elements.downloadPrefDirPath.textContent = dl.downloadDir || '-';
+    if (elements.downloadPrefVideoQuality) elements.downloadPrefVideoQuality.value = dl.preferredVideoQuality || 'auto';
+    if (elements.downloadPrefVideoCodec) elements.downloadPrefVideoCodec.value = dl.preferredVideoCodec || '';
+    if (elements.downloadPrefAudioFormat) elements.downloadPrefAudioFormat.value = dl.preferredAudioFormat || 'mp3';
+    if (elements.downloadPrefAudioQuality) elements.downloadPrefAudioQuality.value = dl.preferredAudioQuality || '192';
+    if (elements.downloadPrefNormalizeAudio) elements.downloadPrefNormalizeAudio.checked = dl.normalizeAudio !== false;
+    if (elements.downloadPrefCookiesBrowser) elements.downloadPrefCookiesBrowser.value = dl.cookiesFromBrowser || '';
+    if (elements.downloadPrefCookiesFile) elements.downloadPrefCookiesFile.value = dl.cookiesFile || '';
+    if (elements.downloadPrefProxy) elements.downloadPrefProxy.value = dl.proxy || '';
+    if (elements.downloadPrefUseConfig) elements.downloadPrefUseConfig.checked = Boolean(dl.useConfig);
+    if (elements.downloadPrefConfigFile) elements.downloadPrefConfigFile.value = dl.configFile || '';
+    if (elements.downloadPrefShowMoreFormats) elements.downloadPrefShowMoreFormats.checked = Boolean(dl.showMoreFormats);
+    if (elements.downloadPrefFormatOverride) elements.downloadPrefFormatOverride.value = dl.formatOverride || '';
+    if (elements.downloadPrefPlaylist) elements.downloadPrefPlaylist.checked = Boolean(dl.playlist);
+    if (elements.downloadPrefPlaylistFilenameFormat) elements.downloadPrefPlaylistFilenameFormat.value = dl.playlistFilenameFormat || '%(playlist_index)s.%(title)s.%(ext)s';
+    if (elements.downloadPrefPlaylistFoldernameFormat) elements.downloadPrefPlaylistFoldernameFormat.value = dl.playlistFoldernameFormat || '%(playlist_title)s';
+    if (elements.downloadPrefCustomArgs) elements.downloadPrefCustomArgs.value = dl.customArgs || '';
+
+    // Toggle rows
+    if (elements.downloadPrefConfigRow && elements.downloadPrefUseConfig) {
+        elements.downloadPrefConfigRow.classList.toggle('hidden', !elements.downloadPrefUseConfig.checked);
+    }
+    if (elements.downloadPrefFormatOverrideRow && elements.downloadPrefShowMoreFormats) {
+        elements.downloadPrefFormatOverrideRow.classList.toggle('hidden', !elements.downloadPrefShowMoreFormats.checked);
+    }
+    if (elements.downloadPrefPlaylistFormats && elements.downloadPrefPlaylist) {
+        elements.downloadPrefPlaylistFormats.classList.toggle('hidden', !elements.downloadPrefPlaylist.checked);
+    }
 }
 
 function applySettings() {
     if (!state.settings) return;
-    
+
     state.settings.playback = {
         crossfadeStopEnabled: document.getElementById('crossfadeStop').checked,
         crossfadeManualEnabled: document.getElementById('crossfadeManual').checked,
@@ -2395,7 +5081,28 @@ function applySettings() {
         fadeOnPauseResume: document.getElementById('fadeOnPause').checked,
         pauseFadeMs: parseInt(document.getElementById('pauseFadeMs').value)
     };
-    
+
+    // Download prefs
+    state.settings.download = {
+        downloadDir: String(elements.downloadPrefDirPath?.textContent || '').trim() === '-' ? '' : String(elements.downloadPrefDirPath?.textContent || '').trim(),
+        preferredVideoQuality: String(elements.downloadPrefVideoQuality?.value || 'auto'),
+        preferredVideoCodec: String(elements.downloadPrefVideoCodec?.value || ''),
+        preferredAudioFormat: String(elements.downloadPrefAudioFormat?.value || 'mp3'),
+        preferredAudioQuality: String(elements.downloadPrefAudioQuality?.value || '192'),
+        normalizeAudio: Boolean(elements.downloadPrefNormalizeAudio?.checked),
+        cookiesFromBrowser: String(elements.downloadPrefCookiesBrowser?.value || ''),
+        cookiesFile: String(elements.downloadPrefCookiesFile?.value || ''),
+        proxy: String(elements.downloadPrefProxy?.value || ''),
+        useConfig: Boolean(elements.downloadPrefUseConfig?.checked),
+        configFile: String(elements.downloadPrefConfigFile?.value || ''),
+        showMoreFormats: Boolean(elements.downloadPrefShowMoreFormats?.checked),
+        formatOverride: String(elements.downloadPrefFormatOverride?.value || ''),
+        playlist: Boolean(elements.downloadPrefPlaylist?.checked),
+        playlistFilenameFormat: String(elements.downloadPrefPlaylistFilenameFormat?.value || '%(playlist_index)s.%(title)s.%(ext)s'),
+        playlistFoldernameFormat: String(elements.downloadPrefPlaylistFoldernameFormat?.value || '%(playlist_title)s'),
+        customArgs: String(elements.downloadPrefCustomArgs?.value || '')
+    };
+
     saveSettings();
 }
 
@@ -2418,14 +5125,61 @@ function showAbout() {
 // KEYBOARD SHORTCUTS
 // ============================================
 function handleKeyboard(e) {
-    // Modal açıkken klavye kısayollarını devre dışı bırak
-    if (!elements.settingsModal.classList.contains('hidden')) return;
-    
+    // Utility sayfalar açıkken klavye kısayollarını devre dışı bırak
+    if (isPageVisible(elements.settingsPage) || isPageVisible(elements.downloadPage) || isPageVisible(elements.securityPage)) return;
+
+    // TAM EKRAN VİDEO KLAVİYE KISAYOLLARI
+    if (document.fullscreenElement && state.activeMedia === 'video') {
+        switch (e.code) {
+            case 'Space':
+                e.preventDefault();
+                handleFsPlayPause();
+                return;
+            case 'ArrowLeft':
+                e.preventDefault();
+                seekVideoRelative(-10);
+                return;
+            case 'ArrowRight':
+                e.preventDefault();
+                seekVideoRelative(10);
+                return;
+            case 'ArrowUp':
+                e.preventDefault();
+                const currentVol = Math.round(elements.videoPlayer.volume * 100);
+                const newVol = Math.min(100, currentVol + 5);
+                elements.videoPlayer.volume = newVol / 100;
+                document.getElementById('fsVolumeSlider').value = newVol;
+                document.getElementById('fsVolumeLabel').textContent = newVol + '%';
+                return;
+            case 'ArrowDown':
+                e.preventDefault();
+                const currentVolDown = Math.round(elements.videoPlayer.volume * 100);
+                const newVolDown = Math.max(0, currentVolDown - 5);
+                elements.videoPlayer.volume = newVolDown / 100;
+                document.getElementById('fsVolumeSlider').value = newVolDown;
+                document.getElementById('fsVolumeLabel').textContent = newVolDown + '%';
+                return;
+            case 'KeyM':
+                e.preventDefault();
+                handleFsMute();
+                return;
+            case 'KeyF':
+            case 'F11':
+                e.preventDefault();
+                exitVideoFullscreen();
+                return;
+            case 'Escape':
+                e.preventDefault();
+                exitVideoFullscreen();
+                return;
+        }
+    }
+
     // CTRL+A - file tree'de tüm dosyaları seç
     if (e.ctrlKey && (e.key === 'a' || e.key === 'A')) {
         e.preventDefault();
         e.stopPropagation();
-        
+
         // Tüm dosya öğelerini seç (klasörleri hariç tut)
         const fileItems = document.querySelectorAll('.tree-item.file');
         if (fileItems.length > 0) {
@@ -2436,7 +5190,7 @@ function handleKeyboard(e) {
         }
         return;
     }
-    
+
     // ENTER - seçili dosyaları playlist'e ekle
     if (e.key === 'Enter') {
         const selectedItems = document.querySelectorAll('.tree-item.file.selected');
@@ -2446,8 +5200,15 @@ function handleKeyboard(e) {
             return;
         }
     }
-    
-    switch(e.code) {
+
+    // F11 - Tam ekran toggle (video sayfasında)
+    if (e.code === 'F11' && state.currentPage === 'video') {
+        e.preventDefault();
+        toggleVideoFullscreen();
+        return;
+    }
+
+    switch (e.code) {
         case 'Space':
             e.preventDefault();
             togglePlayPause();
@@ -2492,7 +5253,7 @@ const VisualizerSettings = {
     glowEnabled: true,
     reflectionEnabled: false,
     hueOffset: 0,
-    
+
     // Available analyzers
     analyzers: {
         'bar': 'Bar çözümleyici',
@@ -2504,9 +5265,9 @@ const VisualizerSettings = {
         'rainbow': 'Rainbow Dash',
         'none': 'Çözümleyici yok'
     },
-    
+
     framerates: [20, 25, 30, 60],
-    
+
     load() {
         try {
             const saved = localStorage.getItem('aurivo_visualizer');
@@ -2522,7 +5283,7 @@ const VisualizerSettings = {
             console.log('Visualizer settings load error:', e);
         }
     },
-    
+
     save() {
         try {
             localStorage.setItem('aurivo_visualizer', JSON.stringify({
@@ -2549,7 +5310,7 @@ const BarAnalyzer = {
     NUM_ROOFS: 16,
     COLUMN_WIDTH: 4,
     GAP: 1,
-    
+
     // State
     bandCount: 64,
     barVector: [],
@@ -2561,53 +5322,53 @@ const BarAnalyzer = {
     maxUp: 4,
     psychedelicEnabled: true,
     hueOffset: 0,
-    
+
     // Initialize analyzer
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
-        
+
         // Create level mapper (logarithmic scale)
         const MAX_AMPLITUDE = 1.0;
         const F = (canvas.height - 2) / (Math.log10(255) * MAX_AMPLITUDE);
-        
+
         for (let x = 0; x < 256; x++) {
             this.lvlMapper[x] = Math.floor(F * Math.log10(x + 1));
         }
     },
-    
+
     resize() {
         if (!this.canvas) return;
-        
+
         const width = this.canvas.width;
         const height = this.canvas.height;
-        
+
         if (width <= 0 || height <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.COLUMN_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
-        
+
         this.maxDown = -Math.max(1, Math.floor(height / 50));
         this.maxUp = Math.max(1, Math.floor(height / 25));
-        
+
         // Reset arrays
         this.barVector = new Array(this.bandCount).fill(0);
         this.roofVector = new Array(this.bandCount).fill(height - 5);
         this.roofVelocityVector = new Array(this.bandCount).fill(this.ROOF_VELOCITY_REDUCTION_FACTOR);
         this.roofMem = Array.from({ length: this.bandCount }, () => []);
     },
-    
+
     // Get psychedelic color based on position
     getColor(index, total, brightness = 100) {
         const hue = (this.hueOffset + (index / total) * 360) % 360;
         return `hsl(${hue}, 100%, ${brightness}%)`;
     },
-    
+
     // Get gradient for bar
     getBarGradient(x, height, barHeight) {
         const gradient = this.ctx.createLinearGradient(x, this.canvas.height, x, this.canvas.height - barHeight);
-        
+
         if (this.psychedelicEnabled) {
             const hue = (this.hueOffset + (x / this.canvas.width) * 360) % 360;
             gradient.addColorStop(0, `hsl(${hue}, 100%, 60%)`);
@@ -2618,68 +5379,68 @@ const BarAnalyzer = {
             gradient.addColorStop(0.5, '#00a8cc');
             gradient.addColorStop(1, '#006688');
         }
-        
+
         return gradient;
     },
-    
+
     // Main analyze function - processes spectrum data
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         // Clear canvas
         ctx.fillStyle = '#121212';
         ctx.fillRect(0, 0, width, height);
-        
+
         if (!isPlaying || !spectrumData || spectrumData.length === 0) {
             // Draw idle bars
             this.drawIdleBars();
             return;
         }
-        
+
         // Update hue for psychedelic mode
         if (this.psychedelicEnabled) {
             this.hueOffset = (this.hueOffset + 0.5) % 360;
         }
-        
+
         // Interpolate spectrum data to match band count
         const scope = this.interpolateSpectrum(spectrumData, this.bandCount);
-        
+
         // Process each band
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
-            
+
             // Map spectrum value to height
             let y2 = Math.floor(scope[i] * 256);
             y2 = this.lvlMapper[Math.min(y2, 255)];
-            
+
             // Smooth falling
             const change = y2 - this.barVector[i];
             if (change < this.maxDown) {
                 y2 = this.barVector[i] + this.maxDown;
             }
-            
+
             // Update roof (peak indicator)
             if (y2 > this.roofVector[i]) {
                 this.roofVector[i] = y2;
                 this.roofVelocityVector[i] = 1;
             }
-            
+
             this.barVector[i] = y2;
-            
+
             // Draw bar with gradient
             if (y2 > 0) {
                 ctx.fillStyle = this.getBarGradient(x, height, y2);
                 ctx.fillRect(x, height - y2, this.COLUMN_WIDTH, y2);
             }
-            
+
             // Draw roof (peak indicators)
             if (this.roofMem[i].length > this.NUM_ROOFS) {
                 this.roofMem[i].shift();
             }
-            
+
             // Draw fading roof trail
             for (let c = 0; c < this.roofMem[i].length; c++) {
                 const roofY = this.roofMem[i][c];
@@ -2688,22 +5449,22 @@ const BarAnalyzer = {
                 ctx.fillStyle = `hsla(${hue}, 100%, 70%, ${alpha * 0.5})`;
                 ctx.fillRect(x, roofY, this.COLUMN_WIDTH, 2);
             }
-            
+
             // Current roof
             const roofY = height - this.roofVector[i] - 2;
             this.roofMem[i].push(roofY);
-            
+
             // Draw current roof (peak)
             const roofHue = (this.hueOffset + (i / this.bandCount) * 360 + 180) % 360;
             ctx.fillStyle = `hsl(${roofHue}, 100%, 80%)`;
             ctx.fillRect(x, roofY, this.COLUMN_WIDTH, 2);
-            
+
             // Update roof physics
             if (this.roofVelocityVector[i] !== 0) {
                 if (this.roofVelocityVector[i] > 32) {
                     this.roofVector[i] -= Math.floor((this.roofVelocityVector[i] - 32) / 20);
                 }
-                
+
                 if (this.roofVector[i] < 0) {
                     this.roofVector[i] = 0;
                     this.roofVelocityVector[i] = 0;
@@ -2713,38 +5474,38 @@ const BarAnalyzer = {
             }
         }
     },
-    
+
     // Draw idle bars when not playing
     drawIdleBars() {
         const ctx = this.ctx;
         const canvas = this.canvas;
-        
+
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
             const hue = (this.hueOffset + (i / this.bandCount) * 360) % 360;
             ctx.fillStyle = `hsla(${hue}, 100%, 50%, 0.3)`;
             ctx.fillRect(x, canvas.height - 3, this.COLUMN_WIDTH, 3);
         }
-        
+
         this.hueOffset = (this.hueOffset + 0.2) % 360;
     },
-    
+
     // Interpolate spectrum data
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
-        
+
         for (let i = 0; i < targetSize; i++) {
             const srcIndex = i * ratio;
             const low = Math.floor(srcIndex);
             const high = Math.min(low + 1, data.length - 1);
             const frac = srcIndex - low;
-            
+
             // Linear interpolation with slight boost for lower frequencies
             const boost = 1 + (1 - i / targetSize) * 0.5;
             result[i] = ((1 - frac) * data[low] + frac * data[high]) * boost;
         }
-        
+
         return result;
     }
 };
@@ -2758,7 +5519,7 @@ const BlockAnalyzer = {
     BLOCK_WIDTH: 4,
     GAP: 1,
     FADE_SIZE: 90,
-    
+
     bandCount: 64,
     rows: 20,
     scope: [],
@@ -2767,54 +5528,54 @@ const BlockAnalyzer = {
     hueOffset: 0,
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         const height = this.canvas.height;
         if (width <= 0 || height <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.BLOCK_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
         this.rows = Math.floor(height / (this.BLOCK_HEIGHT + this.GAP));
         if (this.rows === 0) this.rows = 1;
-        
+
         this.scope = new Array(this.bandCount).fill(0);
         this.bandInfo = Array.from({ length: this.bandCount }, () => ({ height: 0, row: 0 }));
         this.step = 0.5;
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         ctx.fillStyle = '#121212';
         ctx.fillRect(0, 0, width, height);
-        
+
         if (!isPlaying || !spectrumData || spectrumData.length === 0) {
             this.drawIdle();
             return;
         }
-        
+
         if (VisualizerSettings.psychedelicEnabled) {
             this.hueOffset = (this.hueOffset + 0.5) % 360;
         }
-        
+
         // Interpolate spectrum
         const interpolated = this.interpolateSpectrum(spectrumData, this.bandCount);
-        
+
         for (let x = 0; x < this.bandCount; x++) {
             const value = interpolated[x];
             let targetRow = Math.floor(value * this.rows);
-            
+
             // Smooth animation
             if (targetRow < this.bandInfo[x].row) {
                 this.bandInfo[x].height += this.step;
@@ -2823,15 +5584,15 @@ const BlockAnalyzer = {
                 this.bandInfo[x].height = targetRow;
                 this.bandInfo[x].row = targetRow;
             }
-            
+
             const row = Math.min(this.bandInfo[x].row, this.rows);
             const xPos = x * (this.BLOCK_WIDTH + this.GAP);
-            
+
             // Draw blocks
             for (let y = 0; y < row; y++) {
                 const yPos = height - (y + 1) * (this.BLOCK_HEIGHT + this.GAP);
                 const intensity = 1 - (y / this.rows);
-                
+
                 if (VisualizerSettings.psychedelicEnabled) {
                     const hue = (this.hueOffset + (x / this.bandCount) * 360 + y * 5) % 360;
                     ctx.fillStyle = `hsl(${hue}, 100%, ${50 + intensity * 30}%)`;
@@ -2839,12 +5600,12 @@ const BlockAnalyzer = {
                     const g = Math.floor(100 + intensity * 155);
                     ctx.fillStyle = `rgb(0, ${g}, ${Math.floor(g * 0.8)})`;
                 }
-                
+
                 ctx.fillRect(xPos, yPos, this.BLOCK_WIDTH, this.BLOCK_HEIGHT);
             }
         }
     },
-    
+
     drawIdle() {
         const ctx = this.ctx;
         const canvas = this.canvas;
@@ -2856,7 +5617,7 @@ const BlockAnalyzer = {
         }
         this.hueOffset = (this.hueOffset + 0.2) % 360;
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -2880,7 +5641,7 @@ const BoomAnalyzer = {
     GAP: 1,
     K_BAR_HEIGHT: 1.271,
     F_PEAK_SPEED: 1.103,
-    
+
     bandCount: 64,
     barHeight: [],
     peakHeight: [],
@@ -2889,54 +5650,54 @@ const BoomAnalyzer = {
     hueOffset: 0,
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         const height = this.canvas.height;
         if (width <= 0 || height <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.COLUMN_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
-        
+
         this.F = height / (Math.log10(256) * 1.1);
         this.barHeight = new Array(this.bandCount).fill(0);
         this.peakHeight = new Array(this.bandCount).fill(0);
         this.peakSpeed = new Array(this.bandCount).fill(0.01);
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         ctx.fillStyle = '#121212';
         ctx.fillRect(0, 0, width, height);
-        
+
         if (!isPlaying || !spectrumData || spectrumData.length === 0) {
             this.drawIdle();
             return;
         }
-        
+
         if (VisualizerSettings.psychedelicEnabled) {
             this.hueOffset = (this.hueOffset + 0.5) % 360;
         }
-        
+
         const scope = this.interpolateSpectrum(spectrumData, this.bandCount);
         const maxHeight = height - 1;
-        
+
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
             let h = Math.log10(scope[i] * 256 + 1) * this.F;
             if (h > maxHeight) h = maxHeight;
-            
+
             if (h > this.barHeight[i]) {
                 this.barHeight[i] = h;
                 if (h > this.peakHeight[i]) {
@@ -2949,7 +5710,7 @@ const BoomAnalyzer = {
                     if (this.barHeight[i] < 0) this.barHeight[i] = 0;
                 }
             }
-            
+
             // Peak handling
             if (this.peakHeight[i] > 0) {
                 this.peakHeight[i] -= this.peakSpeed[i];
@@ -2959,9 +5720,9 @@ const BoomAnalyzer = {
                 }
                 if (this.peakHeight[i] < 0) this.peakHeight[i] = 0;
             }
-            
+
             const y = height - this.barHeight[i];
-            
+
             // Draw bar with gradient
             if (this.barHeight[i] > 0) {
                 const gradient = ctx.createLinearGradient(x, height, x, y);
@@ -2976,7 +5737,7 @@ const BoomAnalyzer = {
                 ctx.fillStyle = gradient;
                 ctx.fillRect(x, y, this.COLUMN_WIDTH, this.barHeight[i]);
             }
-            
+
             // Draw peak
             const peakY = height - this.peakHeight[i];
             if (VisualizerSettings.psychedelicEnabled) {
@@ -2988,7 +5749,7 @@ const BoomAnalyzer = {
             ctx.fillRect(x, peakY - 2, this.COLUMN_WIDTH, 2);
         }
     },
-    
+
     drawIdle() {
         const ctx = this.ctx;
         const canvas = this.canvas;
@@ -3000,7 +5761,7 @@ const BoomAnalyzer = {
         }
         this.hueOffset = (this.hueOffset + 0.2) % 360;
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -3024,7 +5785,7 @@ const TurbineAnalyzer = {
     GAP: 1,
     K_BAR_HEIGHT: 1.271,
     F_PEAK_SPEED: 1.103,
-    
+
     bandCount: 64,
     barHeight: [],
     peakHeight: [],
@@ -3033,54 +5794,54 @@ const TurbineAnalyzer = {
     hueOffset: 0,
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         const height = this.canvas.height;
         if (width <= 0 || height <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.COLUMN_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
-        
+
         this.F = (height / 2) / (Math.log10(256) * 1.1);
         this.barHeight = new Array(this.bandCount).fill(0);
         this.peakHeight = new Array(this.bandCount).fill(0);
         this.peakSpeed = new Array(this.bandCount).fill(0.01);
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
         const hd2 = height / 2;
-        
+
         ctx.fillStyle = '#121212';
         ctx.fillRect(0, 0, width, height);
-        
+
         if (!isPlaying || !spectrumData || spectrumData.length === 0) {
             this.drawIdle();
             return;
         }
-        
+
         if (VisualizerSettings.psychedelicEnabled) {
             this.hueOffset = (this.hueOffset + 0.5) % 360;
         }
-        
+
         const scope = this.interpolateSpectrum(spectrumData, this.bandCount);
         const maxHeight = hd2 - 1;
-        
+
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
             let h = Math.min(Math.log10(scope[i] * 256 + 1) * this.F * 0.5, maxHeight);
-            
+
             if (h > this.barHeight[i]) {
                 this.barHeight[i] = h;
                 if (h > this.peakHeight[i]) {
@@ -3093,15 +5854,15 @@ const TurbineAnalyzer = {
                     if (this.barHeight[i] < 0) this.barHeight[i] = 0;
                 }
             }
-            
+
             if (this.peakHeight[i] > 0) {
                 this.peakHeight[i] -= this.peakSpeed[i];
                 this.peakSpeed[i] *= this.F_PEAK_SPEED;
                 this.peakHeight[i] = Math.max(0, Math.max(this.barHeight[i], this.peakHeight[i]));
             }
-            
+
             const barH = this.barHeight[i];
-            
+
             // Draw mirrored bars (turbine effect)
             if (barH > 0) {
                 const gradient = ctx.createLinearGradient(x, hd2 - barH, x, hd2 + barH);
@@ -3116,13 +5877,13 @@ const TurbineAnalyzer = {
                     gradient.addColorStop(1, '#004466');
                 }
                 ctx.fillStyle = gradient;
-                
+
                 // Top bar
                 ctx.fillRect(x, hd2 - barH, this.COLUMN_WIDTH, barH);
                 // Bottom bar (mirrored)
                 ctx.fillRect(x, hd2, this.COLUMN_WIDTH, barH);
             }
-            
+
             // Draw peaks
             const peakH = this.peakHeight[i];
             if (VisualizerSettings.psychedelicEnabled) {
@@ -3134,12 +5895,12 @@ const TurbineAnalyzer = {
             ctx.fillRect(x, hd2 - peakH - 1, this.COLUMN_WIDTH, 2);
             ctx.fillRect(x, hd2 + peakH - 1, this.COLUMN_WIDTH, 2);
         }
-        
+
         // Center line
         ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
         ctx.fillRect(0, hd2, width, 1);
     },
-    
+
     drawIdle() {
         const ctx = this.ctx;
         const canvas = this.canvas;
@@ -3152,7 +5913,7 @@ const TurbineAnalyzer = {
         }
         this.hueOffset = (this.hueOffset + 0.2) % 360;
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -3177,19 +5938,19 @@ const SonogramAnalyzer = {
     scopeSize: 128,
     imageData: null,
     hueOffset: 0,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         const height = this.canvas.height;
         if (width <= 0 || height <= 0) return;
-        
+
         this.imageData = this.ctx.createImageData(width, height);
         // Fill with background color
         for (let i = 0; i < this.imageData.data.length; i += 4) {
@@ -3199,17 +5960,17 @@ const SonogramAnalyzer = {
             this.imageData.data[i + 3] = 255;
         }
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         if (!this.imageData || this.imageData.width !== width) {
             this.resize();
         }
-        
+
         // Shift image left by 1 pixel
         const data = this.imageData.data;
         for (let y = 0; y < height; y++) {
@@ -3222,10 +5983,10 @@ const SonogramAnalyzer = {
                 data[dstIdx + 3] = data[srcIdx + 3];
             }
         }
-        
+
         // Draw new column on the right
         const x = width - 1;
-        
+
         if (!isPlaying || !spectrumData || spectrumData.length === 0) {
             // Draw idle column
             for (let y = 0; y < height; y++) {
@@ -3239,13 +6000,13 @@ const SonogramAnalyzer = {
             if (VisualizerSettings.psychedelicEnabled) {
                 this.hueOffset = (this.hueOffset + 0.5) % 360;
             }
-            
+
             const scope = this.interpolateSpectrum(spectrumData, height);
-            
+
             for (let y = 0; y < height; y++) {
                 const idx = ((height - 1 - y) * width + x) * 4;
                 const value = scope[y];
-                
+
                 if (value < 0.005) {
                     data[idx] = 18;
                     data[idx + 1] = 18;
@@ -3269,10 +6030,10 @@ const SonogramAnalyzer = {
                 data[idx + 3] = 255;
             }
         }
-        
+
         ctx.putImageData(this.imageData, 0, 0);
     },
-    
+
     hslToRgb(h, s, l) {
         let r, g, b;
         if (s === 0) {
@@ -3281,20 +6042,20 @@ const SonogramAnalyzer = {
             const hue2rgb = (p, q, t) => {
                 if (t < 0) t += 1;
                 if (t > 1) t -= 1;
-                if (t < 1/6) return p + (q - p) * 6 * t;
-                if (t < 1/2) return q;
-                if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                if (t < 1 / 6) return p + (q - p) * 6 * t;
+                if (t < 1 / 2) return q;
+                if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
                 return p;
             };
             const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
             const p = 2 * l - q;
-            r = hue2rgb(p, q, h + 1/3);
+            r = hue2rgb(p, q, h + 1 / 3);
             g = hue2rgb(p, q, h);
-            b = hue2rgb(p, q, h - 1/3);
+            b = hue2rgb(p, q, h - 1 / 3);
         }
         return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -3315,78 +6076,78 @@ const SonogramAnalyzer = {
 const RainbowDashAnalyzer = {
     COLUMN_WIDTH: 6,
     GAP: 2,
-    
+
     bandCount: 32,
     barHeight: [],
     hueOffset: 0,
     waveOffset: 0,
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         if (width <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.COLUMN_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
         this.barHeight = new Array(this.bandCount).fill(0);
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         ctx.fillStyle = '#121212';
         ctx.fillRect(0, 0, width, height);
-        
+
         this.hueOffset = (this.hueOffset + 2) % 360;
         this.waveOffset += 0.1;
-        
-        const scope = isPlaying && spectrumData 
+
+        const scope = isPlaying && spectrumData
             ? this.interpolateSpectrum(spectrumData, this.bandCount)
             : new Array(this.bandCount).fill(0);
-        
+
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
-            
+
             // Add wave effect
             const wave = Math.sin(this.waveOffset + i * 0.3) * 10;
             let targetHeight = scope[i] * height * 0.8 + (isPlaying ? wave : 0);
             if (targetHeight < 5) targetHeight = 5;
-            
+
             // Smooth animation
             this.barHeight[i] += (targetHeight - this.barHeight[i]) * 0.3;
-            
+
             const barH = this.barHeight[i];
             const y = height - barH;
-            
+
             // Rainbow gradient
             const gradient = ctx.createLinearGradient(x, height, x, y);
             const hue1 = (this.hueOffset + i * 15) % 360;
             const hue2 = (hue1 + 60) % 360;
             const hue3 = (hue1 + 120) % 360;
-            
+
             gradient.addColorStop(0, `hsl(${hue1}, 100%, 50%)`);
             gradient.addColorStop(0.5, `hsl(${hue2}, 100%, 60%)`);
             gradient.addColorStop(1, `hsl(${hue3}, 100%, 40%)`);
-            
+
             ctx.fillStyle = gradient;
-            
+
             // Rounded bars
             const radius = Math.min(this.COLUMN_WIDTH / 2, 3);
             ctx.beginPath();
             ctx.roundRect(x, y, this.COLUMN_WIDTH, barH, [radius, radius, 0, 0]);
             ctx.fill();
-            
+
             // Glow effect
             if (VisualizerSettings.glowEnabled && barH > 10) {
                 ctx.shadowBlur = 15;
@@ -3396,7 +6157,7 @@ const RainbowDashAnalyzer = {
             }
         }
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -3417,32 +6178,32 @@ const RainbowDashAnalyzer = {
 const NyanalyzerCatAnalyzer = {
     COLUMN_WIDTH: 5,
     GAP: 1,
-    
+
     bandCount: 48,
     barHeight: [],
     starPositions: [],
     hueOffset: 0,
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
         this.resize();
         this.generateStars();
     },
-    
+
     resize() {
         if (!this.canvas) return;
         const width = this.canvas.width;
         if (width <= 0) return;
-        
+
         this.bandCount = Math.floor(width / (this.COLUMN_WIDTH + this.GAP));
         if (this.bandCount === 0) this.bandCount = 1;
         this.barHeight = new Array(this.bandCount).fill(0);
         this.generateStars();
     },
-    
+
     generateStars() {
         this.starPositions = [];
         for (let i = 0; i < 30; i++) {
@@ -3454,51 +6215,51 @@ const NyanalyzerCatAnalyzer = {
             });
         }
     },
-    
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
         const width = canvas.width;
         const height = canvas.height;
-        
+
         // Dark space background
         const bgGradient = ctx.createLinearGradient(0, 0, 0, height);
         bgGradient.addColorStop(0, '#0a0a1a');
         bgGradient.addColorStop(1, '#1a0a2a');
         ctx.fillStyle = bgGradient;
         ctx.fillRect(0, 0, width, height);
-        
+
         // Draw moving stars
         this.hueOffset = (this.hueOffset + 1) % 360;
         for (const star of this.starPositions) {
             star.x -= star.speed;
             if (star.x < 0) star.x = width;
-            
+
             ctx.fillStyle = `rgba(255, 255, 255, ${0.5 + Math.sin(Date.now() / 200 + star.x) * 0.3})`;
             ctx.beginPath();
             ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
             ctx.fill();
         }
-        
-        const scope = isPlaying && spectrumData 
+
+        const scope = isPlaying && spectrumData
             ? this.interpolateSpectrum(spectrumData, this.bandCount)
             : new Array(this.bandCount).fill(0);
-        
+
         for (let i = 0; i < this.bandCount; i++) {
             const x = i * (this.COLUMN_WIDTH + this.GAP);
-            
+
             let targetHeight = scope[i] * height * 0.7;
             if (targetHeight < 3) targetHeight = 3;
-            
+
             this.barHeight[i] += (targetHeight - this.barHeight[i]) * 0.25;
-            
+
             const barH = this.barHeight[i];
             const y = height - barH;
-            
+
             // Nyan cat rainbow colors
             const rainbowColors = ['#ff0000', '#ff9900', '#ffff00', '#33ff00', '#0099ff', '#6633ff'];
             const colorIndex = i % rainbowColors.length;
-            
+
             // Draw rainbow trail segments
             const segmentHeight = barH / rainbowColors.length;
             for (let c = 0; c < rainbowColors.length; c++) {
@@ -3510,7 +6271,7 @@ const NyanalyzerCatAnalyzer = {
             ctx.globalAlpha = 1;
         }
     },
-    
+
     interpolateSpectrum(data, targetSize) {
         const result = new Array(targetSize);
         const ratio = data.length / targetSize;
@@ -3531,14 +6292,14 @@ const NyanalyzerCatAnalyzer = {
 const NoAnalyzer = {
     canvas: null,
     ctx: null,
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
     },
-    
-    resize() {},
-    
+
+    resize() { },
+
     analyze(spectrumData, isPlaying) {
         const ctx = this.ctx;
         const canvas = this.canvas;
@@ -3554,7 +6315,7 @@ const AnalyzerContainer = {
     currentAnalyzer: null,
     canvas: null,
     ctx: null,
-    
+
     analyzers: {
         'bar': BarAnalyzer,
         'block': BlockAnalyzer,
@@ -3565,20 +6326,20 @@ const AnalyzerContainer = {
         'nyanalyzer': NyanalyzerCatAnalyzer,
         'none': NoAnalyzer
     },
-    
+
     init(canvas) {
         this.canvas = canvas;
         this.ctx = canvas.getContext('2d');
-        
+
         // Initialize all analyzers
         for (const key in this.analyzers) {
             this.analyzers[key].init(canvas);
         }
-        
+
         // Set current analyzer
         this.setAnalyzer(VisualizerSettings.currentAnalyzer);
     },
-    
+
     resize() {
         for (const key in this.analyzers) {
             if (this.analyzers[key].resize) {
@@ -3586,7 +6347,7 @@ const AnalyzerContainer = {
             }
         }
     },
-    
+
     setAnalyzer(type) {
         if (this.analyzers[type]) {
             this.currentAnalyzer = this.analyzers[type];
@@ -3595,7 +6356,7 @@ const AnalyzerContainer = {
             updateContextMenuState();
         }
     },
-    
+
     analyze(spectrumData, isPlaying) {
         if (this.currentAnalyzer) {
             this.currentAnalyzer.analyze(spectrumData, isPlaying);
@@ -3609,28 +6370,28 @@ const AnalyzerContainer = {
 function setupVisualizerContextMenu() {
     const canvas = elements.visualizerCanvas;
     const contextMenu = document.getElementById('visualizerContextMenu');
-    
+
     if (!canvas || !contextMenu) return;
-    
+
     // Right-click handler
     canvas.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         showContextMenu(e.clientX, e.clientY);
     });
-    
+
     // Left-click also opens menu (like Qt version)
     canvas.addEventListener('click', (e) => {
         e.preventDefault();
         showContextMenu(e.clientX, e.clientY);
     });
-    
+
     // Hide menu when clicking outside
     document.addEventListener('click', (e) => {
         if (!contextMenu.contains(e.target) && e.target !== canvas) {
             hideContextMenu();
         }
     });
-    
+
     // Analyzer type selection
     contextMenu.querySelectorAll('[data-analyzer]').forEach(item => {
         item.addEventListener('click', () => {
@@ -3639,7 +6400,7 @@ function setupVisualizerContextMenu() {
             hideContextMenu();
         });
     });
-    
+
     // Framerate selection
     contextMenu.querySelectorAll('[data-framerate]').forEach(item => {
         item.addEventListener('click', () => {
@@ -3650,7 +6411,7 @@ function setupVisualizerContextMenu() {
             hideContextMenu();
         });
     });
-    
+
     // Psychedelic toggle
     const psychedelicToggle = document.getElementById('psychedelicToggle');
     if (psychedelicToggle) {
@@ -3660,7 +6421,7 @@ function setupVisualizerContextMenu() {
             updateContextMenuState();
         });
     }
-    
+
     // Visual effects
     contextMenu.querySelectorAll('[data-visual]').forEach(item => {
         item.addEventListener('click', () => {
@@ -3674,7 +6435,7 @@ function setupVisualizerContextMenu() {
             updateContextMenuState();
         });
     });
-    
+
     // Initial state
     updateContextMenuState();
 }
@@ -3682,15 +6443,15 @@ function setupVisualizerContextMenu() {
 function showContextMenu(x, y) {
     const contextMenu = document.getElementById('visualizerContextMenu');
     if (!contextMenu) return;
-    
+
     contextMenu.classList.remove('hidden');
-    
+
     // Position menu
     const menuWidth = contextMenu.offsetWidth;
     const menuHeight = contextMenu.offsetHeight;
     const windowWidth = window.innerWidth;
     const windowHeight = window.innerHeight;
-    
+
     // Adjust position if menu would go off screen
     if (x + menuWidth > windowWidth) {
         x = windowWidth - menuWidth - 10;
@@ -3698,7 +6459,7 @@ function showContextMenu(x, y) {
     if (y + menuHeight > windowHeight) {
         y = windowHeight - menuHeight - 10;
     }
-    
+
     contextMenu.style.left = x + 'px';
     contextMenu.style.top = y + 'px';
 }
@@ -3713,7 +6474,7 @@ function hideContextMenu() {
 function updateContextMenuState() {
     const contextMenu = document.getElementById('visualizerContextMenu');
     if (!contextMenu) return;
-    
+
     // Update analyzer selection
     contextMenu.querySelectorAll('[data-analyzer]').forEach(item => {
         if (item.dataset.analyzer === VisualizerSettings.currentAnalyzer) {
@@ -3722,7 +6483,7 @@ function updateContextMenuState() {
             item.classList.remove('active');
         }
     });
-    
+
     // Update framerate selection
     contextMenu.querySelectorAll('[data-framerate]').forEach(item => {
         if (parseInt(item.dataset.framerate) === VisualizerSettings.currentFramerate) {
@@ -3731,7 +6492,7 @@ function updateContextMenuState() {
             item.classList.remove('active');
         }
     });
-    
+
     // Update psychedelic toggle
     const psychedelicToggle = document.getElementById('psychedelicToggle');
     if (psychedelicToggle) {
@@ -3741,14 +6502,14 @@ function updateContextMenuState() {
             psychedelicToggle.classList.remove('checked');
         }
     }
-    
+
     // Update visual effects
     contextMenu.querySelectorAll('[data-visual]').forEach(item => {
         const effect = item.dataset.visual;
         let isEnabled = false;
         if (effect === 'glow') isEnabled = VisualizerSettings.glowEnabled;
         if (effect === 'reflection') isEnabled = VisualizerSettings.reflectionEnabled;
-        
+
         if (isEnabled) {
             item.classList.add('checked');
         } else {
@@ -3760,10 +6521,10 @@ function updateContextMenuState() {
 function setupVisualizer() {
     const canvas = elements.visualizerCanvas;
     const ctx = canvas.getContext('2d');
-    
+
     // Load settings
     VisualizerSettings.load();
-    
+
     // Canvas boyutunu ayarla
     function resizeCanvas() {
         canvas.width = canvas.offsetWidth;
@@ -3772,13 +6533,13 @@ function setupVisualizer() {
     }
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
-    
+
     // Initialize Analyzer Container
     AnalyzerContainer.init(canvas);
-    
+
     // Setup context menu
     setupVisualizerContextMenu();
-    
+
     // C++ Audio Engine varsa ona bağlan, yoksa Web Audio API kullan
     if (useNativeAudio && window.aurivo && window.aurivo.audio) {
         console.log('🎵 C++ FFT verisi ile Analyzer Container başlatılıyor...');
@@ -3789,13 +6550,13 @@ function setupVisualizer() {
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             analyser = audioContext.createAnalyser();
             analyser.fftSize = 256;
-            
+
             const source = audioContext.createMediaElementSource(elements.audio);
             source.connect(analyser);
             analyser.connect(audioContext.destination);
-            
+
             dataArray = new Uint8Array(analyser.frequencyBinCount);
-            
+
             drawVisualizer(ctx, canvas);
         } catch (e) {
             console.log('Visualizer başlatılamadı:', e);
@@ -3807,16 +6568,16 @@ function setupVisualizer() {
 // C++ Audio Engine FFT verisi ile visualizer
 async function drawNativeVisualizer(ctx, canvas) {
     setTimeout(() => drawNativeVisualizer(ctx, canvas), 1000 / VisualizerSettings.currentFramerate);
-    
+
     const isPlaying = state.isPlaying && state.activeMedia === 'audio';
-    
+
     try {
         // C++ engine'den spectrum verisini al - doğru API yolu
         let spectrumData = null;
         if (isPlaying && window.aurivo && window.aurivo.audio && window.aurivo.audio.spectrum) {
             spectrumData = await window.aurivo.audio.spectrum.getBands(128);
         }
-        
+
         // Analyzer Container ile çiz
         AnalyzerContainer.analyze(spectrumData, isPlaying);
     } catch (e) {
@@ -3827,14 +6588,14 @@ async function drawNativeVisualizer(ctx, canvas) {
 
 function drawVisualizer(ctx, canvas) {
     setTimeout(() => drawVisualizer(ctx, canvas), 1000 / VisualizerSettings.currentFramerate);
-    
+
     if (!analyser) return;
-    
+
     analyser.getByteFrequencyData(dataArray);
-    
+
     // Convert Uint8Array to normalized array
     const normalizedData = Array.from(dataArray).map(v => v / 255);
-    
+
     // Analyzer Container ile çiz
     AnalyzerContainer.analyze(normalizedData, state.isPlaying);
 }
@@ -3843,16 +6604,16 @@ function drawFallbackVisualizer(ctx, canvas) {
     // Basit animasyon (audio context yoksa)
     function animate() {
         setTimeout(animate, 1000 / VisualizerSettings.currentFramerate);
-        
+
         // Fake spectrum data for animation
         const fakeData = state.isPlaying
-            ? Array.from({ length: 64 }, (_, i) => 
+            ? Array.from({ length: 64 }, (_, i) =>
                 (Math.sin(Date.now() / 200 + i * 0.3) * 0.5 + 0.5) * 0.6)
             : null;
-        
+
         AnalyzerContainer.analyze(fakeData, state.isPlaying);
     }
-    
+
     animate();
 }
 
@@ -3866,7 +6627,13 @@ function initializeRainbowSliders() {
     // Başlangıç değerleriyle slider'ları güncelle
     updateRainbowSlider(elements.seekSlider, 0);
     updateRainbowSlider(elements.volumeSlider, state.volume);
-    
+
+    // Tam ekran slider'ları da başlat
+    const fsSeekSlider = document.getElementById('fsSeekSlider');
+    const fsVolumeSlider = document.getElementById('fsVolumeSlider');
+    if (fsSeekSlider) updateRainbowSlider(fsSeekSlider, 0);
+    if (fsVolumeSlider) updateRainbowSlider(fsVolumeSlider, state.volume);
+
     // Rainbow animasyonu başlat
     startRainbowAnimation();
 }
@@ -3874,18 +6641,33 @@ function initializeRainbowSliders() {
 function startRainbowAnimation() {
     function animateRainbow() {
         rainbowHue = (rainbowHue + 1) % 360;
-        
+
         // Seek slider - mevcut değeriyle güncelle
         const seekPercent = (elements.seekSlider.value / elements.seekSlider.max) * 100;
         updateRainbowSliderColors(elements.seekSlider, seekPercent);
-        
+
         // Volume slider - mevcut değeriyle güncelle
         const volumePercent = elements.volumeSlider.value;
         updateRainbowSliderColors(elements.volumeSlider, volumePercent);
-        
+
+        // TAM EKRAN SLIDER'LAR - aynı rainbow efekti
+        const fsSeekSlider = document.getElementById('fsSeekSlider');
+        const fsVolumeSlider = document.getElementById('fsVolumeSlider');
+
+        if (fsSeekSlider) {
+            const fsSeekPercent = (fsSeekSlider.value / fsSeekSlider.max) * 100;
+            updateRainbowSliderColors(fsSeekSlider, fsSeekPercent);
+        }
+
+        if (fsVolumeSlider) {
+            const fsVolumePercent = fsVolumeSlider.value;
+            updateRainbowSliderColors(fsVolumeSlider, fsVolumePercent);
+        }
+
         rainbowAnimationId = requestAnimationFrame(animateRainbow);
     }
     animateRainbow();
+    console.log('🌈 Rainbow animasyon başlatıldı - tam ekran slider\'lar dahil');
 }
 
 function updateRainbowSlider(slider, percent) {
@@ -3902,11 +6684,11 @@ function updateRainbowSliderColors(slider, percent) {
         `hsl(${(rainbowHue + 160) % 360}, 100%, 50%)`,
         `hsl(${(rainbowHue + 200) % 360}, 100%, 50%)`
     ];
-    
+
     // SOL TARAF (0'dan percent'e kadar) = Işiklı rainbow
     // SAĞ TARAF (percent'den 100'e kadar) = Yarı saydam koyu
     const emptyColor = 'rgba(40, 40, 40, 0.25)';
-    
+
     // Background: Sol kısım renkli gradient, sağ kısım saydam
     const trackBackground = `linear-gradient(to right, 
         ${colors[0]} 0%, 
@@ -3917,9 +6699,9 @@ function updateRainbowSliderColors(slider, percent) {
         ${colors[5]} ${percent}%, 
         ${emptyColor} ${percent}%, 
         ${emptyColor} 100%)`;
-    
+
     slider.style.background = trackBackground;
-    
+
     // Thumb için parlak renk
     const thumbColor = `hsl(${(rainbowHue + 60) % 360}, 100%, 60%)`;
     const thumbGlow = `hsl(${(rainbowHue + 60) % 360}, 100%, 50%)`;
@@ -3940,17 +6722,17 @@ const EQController = {
         800, 1000, 1250, 1600, 2000, 2500, 3150, 4000,
         5000, 6300, 8000, 10000, 12500, 16000, 18000, 20000
     ],
-    
+
     // Current band values (dB)
     bands: new Array(32).fill(0),
-    
+
     // Settings
     enabled: true,
     autoGain: true,
     preamp: 0,
     masterVolume: 100,
     bassBoost: 0,
-    
+
     // UI Elements
     elements: {
         modal: null,
@@ -3965,14 +6747,14 @@ const EQController = {
         clippingLed: null,
         levelBars: []
     },
-    
+
     // Factory Presets - Doğru frekans aralıklarına göre ayarlanmış
     // Frequencies: [20, 25, 31, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1k, 1.25k, 1.6k, 2k, 2.5k, 3.15k, 4k, 5k, 6.3k, 8k, 10k, 12.5k, 16k, 18k, 20k]
     factoryPresets: {
-        flat: { 
-            name: 'Flat (Düz)', 
+        flat: {
+            name: 'Flat (Düz)',
             description: 'Tüm bantlar nötr',
-            bands: new Array(32).fill(0), 
+            bands: new Array(32).fill(0),
             bassBoost: 0,
             preamp: 0
         },
@@ -4068,18 +6850,18 @@ const EQController = {
             preamp: 2
         }
     },
-    
+
     // Custom presets (localStorage'dan yüklenir)
     customPresets: {},
-    
+
     // Current preset tracking
     currentPreset: 'flat',
-    
+
     // Legacy alias for backward compatibility
     get presets() {
         return { ...this.factoryPresets, ...this.customPresets };
     },
-    
+
     // Initialize EQ controller
     init() {
         this.cacheElements();
@@ -4092,7 +6874,7 @@ const EQController = {
         this.initKnobs();
         console.log('🎚️ EQ Controller initialized');
     },
-    
+
     // Cache DOM elements
     cacheElements() {
         this.elements.modal = document.getElementById('eqModal');
@@ -4108,7 +6890,7 @@ const EQController = {
         this.elements.bassKnobCanvas = document.getElementById('bassBoostCanvas');
         this.elements.bassKnobValue = document.getElementById('bassBoostValue');
         this.elements.eqButton = document.querySelector('.eq-btn-player');
-        
+
         // Preset manager elements
         this.elements.savePresetModal = document.getElementById('savePresetModal');
         this.elements.presetManagerModal = document.getElementById('presetManagerModal');
@@ -4117,7 +6899,7 @@ const EQController = {
         this.elements.factoryPresetList = document.getElementById('factoryPresetList');
         this.elements.customPresetList = document.getElementById('customPresetList');
     },
-    
+
     // Load custom presets from localStorage
     loadCustomPresets() {
         try {
@@ -4131,7 +6913,7 @@ const EQController = {
             this.customPresets = {};
         }
     },
-    
+
     // Save custom presets to localStorage
     saveCustomPresets() {
         try {
@@ -4140,17 +6922,17 @@ const EQController = {
             console.error('Custom presets kaydedilemedi:', e);
         }
     },
-    
+
     // Populate preset select dropdown
     populatePresetSelect() {
         if (!this.elements.presetSelect) return;
-        
+
         this.elements.presetSelect.innerHTML = '';
-        
+
         // Factory presets group
         const factoryGroup = document.createElement('optgroup');
         factoryGroup.label = '🏭 Fabrika Presetleri';
-        
+
         Object.entries(this.factoryPresets).forEach(([key, preset]) => {
             const option = document.createElement('option');
             option.value = key;
@@ -4158,15 +6940,15 @@ const EQController = {
             option.title = preset.description || '';
             factoryGroup.appendChild(option);
         });
-        
+
         this.elements.presetSelect.appendChild(factoryGroup);
-        
+
         // Custom presets group (if any)
         const customKeys = Object.keys(this.customPresets);
         if (customKeys.length > 0) {
             const customGroup = document.createElement('optgroup');
             customGroup.label = '⭐ Özel Presetler';
-            
+
             customKeys.forEach(key => {
                 const preset = this.customPresets[key];
                 const option = document.createElement('option');
@@ -4176,33 +6958,33 @@ const EQController = {
                 option.dataset.custom = 'true';
                 customGroup.appendChild(option);
             });
-            
+
             this.elements.presetSelect.appendChild(customGroup);
         }
-        
+
         // Set current selection
         if (this.currentPreset) {
             this.elements.presetSelect.value = this.currentPreset;
         }
     },
-    
+
     // Create 32 band sliders
     createBandSliders() {
         if (!this.elements.bandsContainer) return;
-        
+
         this.elements.bandsContainer.innerHTML = '';
         this.elements.sliders = [];
-        
+
         this.frequencies.forEach((freq, index) => {
             const band = document.createElement('div');
             band.className = 'eq-band';
             band.dataset.index = index;
-            
+
             // Value display
             const valueDiv = document.createElement('div');
             valueDiv.className = 'eq-band-value';
             valueDiv.textContent = '0';
-            
+
             // Slider
             const slider = document.createElement('input');
             slider.type = 'range';
@@ -4212,21 +6994,21 @@ const EQController = {
             slider.step = 0.5;
             slider.value = this.bands[index];
             slider.dataset.index = index;
-            
+
             // Frequency label
             const freqLabel = document.createElement('div');
             freqLabel.className = 'eq-band-freq';
             freqLabel.textContent = this.formatFrequency(freq);
-            
+
             band.appendChild(valueDiv);
             band.appendChild(slider);
             band.appendChild(freqLabel);
             this.elements.bandsContainer.appendChild(band);
-            
+
             this.elements.sliders.push({ slider, valueDiv, band });
         });
     },
-    
+
     // Format frequency for display
     formatFrequency(freq) {
         if (freq >= 1000) {
@@ -4234,7 +7016,7 @@ const EQController = {
         }
         return freq.toString();
     },
-    
+
     // Setup event listeners
     setupEventListeners() {
         // EQ button to open Sound Effects window
@@ -4250,23 +7032,23 @@ const EQController = {
                 }
             });
         }
-        
+
         // Band sliders
         this.elements.sliders.forEach(({ slider, valueDiv, band }, index) => {
             slider.addEventListener('input', (e) => {
                 const value = parseFloat(e.target.value);
                 this.setBand(index, value);
                 valueDiv.textContent = value > 0 ? `+${value}` : value;
-                
+
                 // Update band class
                 band.classList.remove('positive', 'negative');
                 if (value > 0) band.classList.add('positive');
                 if (value < 0) band.classList.add('negative');
             });
-            
+
             slider.addEventListener('mouseenter', () => band.classList.add('active'));
             slider.addEventListener('mouseleave', () => band.classList.remove('active'));
-            
+
             // Double click to reset
             slider.addEventListener('dblclick', () => {
                 slider.value = 0;
@@ -4275,7 +7057,7 @@ const EQController = {
                 band.classList.remove('positive', 'negative');
             });
         });
-        
+
         // Preamp slider
         if (this.elements.preampSlider) {
             this.elements.preampSlider.addEventListener('input', (e) => {
@@ -4287,7 +7069,7 @@ const EQController = {
                 }
             });
         }
-        
+
         // Master volume slider
         if (this.elements.volumeSlider) {
             this.elements.volumeSlider.addEventListener('input', (e) => {
@@ -4299,14 +7081,14 @@ const EQController = {
                 }
             });
         }
-        
+
         // Preset select
         if (this.elements.presetSelect) {
             this.elements.presetSelect.addEventListener('change', (e) => {
                 this.applyPreset(e.target.value);
             });
         }
-        
+
         // Enable toggle
         if (this.elements.enableToggle) {
             this.elements.enableToggle.addEventListener('change', (e) => {
@@ -4314,7 +7096,7 @@ const EQController = {
                 this.updateEQState();
             });
         }
-        
+
         // Auto-gain toggle
         if (this.elements.autoGainToggle) {
             this.elements.autoGainToggle.addEventListener('change', (e) => {
@@ -4322,37 +7104,37 @@ const EQController = {
                 this.updateAutoGain();
             });
         }
-        
+
         // Reset button
         const resetBtn = document.getElementById('resetEQBtn');
         if (resetBtn) {
             resetBtn.addEventListener('click', () => this.resetAll());
         }
-        
+
         // Save preset button (footer)
         const savePresetBtn = document.getElementById('eqSavePreset');
         if (savePresetBtn) {
             savePresetBtn.addEventListener('click', () => this.openSavePresetModal());
         }
-        
+
         // Manage presets button
         const managePresetsBtn = document.getElementById('eqManagePresets');
         if (managePresetsBtn) {
             managePresetsBtn.addEventListener('click', () => this.openPresetManager());
         }
-        
+
         // Close button
         const closeBtn = document.getElementById('closeEQ');
         if (closeBtn) {
             closeBtn.addEventListener('click', () => this.closeModal());
         }
-        
+
         // Close button (footer)
         const closeFooterBtn = document.getElementById('eqClose');
         if (closeFooterBtn) {
             closeFooterBtn.addEventListener('click', () => this.closeModal());
         }
-        
+
         // Close on backdrop click
         if (this.elements.modal) {
             this.elements.modal.addEventListener('click', (e) => {
@@ -4361,7 +7143,7 @@ const EQController = {
                 }
             });
         }
-        
+
         // Keyboard shortcuts
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
@@ -4379,7 +7161,7 @@ const EQController = {
             }
         });
     },
-    
+
     // Setup preset manager event listeners
     setupPresetManagerListeners() {
         // Save preset modal
@@ -4387,28 +7169,28 @@ const EQController = {
         if (closeSavePreset) {
             closeSavePreset.addEventListener('click', () => this.closeSavePresetModal());
         }
-        
+
         const cancelSavePreset = document.getElementById('cancelSavePreset');
         if (cancelSavePreset) {
             cancelSavePreset.addEventListener('click', () => this.closeSavePresetModal());
         }
-        
+
         const confirmSavePreset = document.getElementById('confirmSavePreset');
         if (confirmSavePreset) {
             confirmSavePreset.addEventListener('click', () => this.saveCustomPreset());
         }
-        
+
         // Preset manager modal
         const closePresetManager = document.getElementById('closePresetManager');
         if (closePresetManager) {
             closePresetManager.addEventListener('click', () => this.closePresetManager());
         }
-        
+
         const closePresetManagerBtn = document.getElementById('closePresetManagerBtn');
         if (closePresetManagerBtn) {
             closePresetManagerBtn.addEventListener('click', () => this.closePresetManager());
         }
-        
+
         // Tab switching
         document.querySelectorAll('.preset-tab').forEach(tab => {
             tab.addEventListener('click', (e) => {
@@ -4416,23 +7198,23 @@ const EQController = {
                 this.switchPresetTab(targetTab);
             });
         });
-        
+
         // Export/Import buttons
         const exportBtn = document.getElementById('exportPresets');
         if (exportBtn) {
             exportBtn.addEventListener('click', () => this.exportPresets());
         }
-        
+
         const importBtn = document.getElementById('importPresets');
         if (importBtn) {
             importBtn.addEventListener('click', () => document.getElementById('importFile')?.click());
         }
-        
+
         const importFile = document.getElementById('importFile');
         if (importFile) {
             importFile.addEventListener('change', (e) => this.importPresets(e));
         }
-        
+
         // Modal backdrop clicks
         if (this.elements.savePresetModal) {
             this.elements.savePresetModal.addEventListener('click', (e) => {
@@ -4441,7 +7223,7 @@ const EQController = {
                 }
             });
         }
-        
+
         if (this.elements.presetManagerModal) {
             this.elements.presetManagerModal.addEventListener('click', (e) => {
                 if (e.target === this.elements.presetManagerModal) {
@@ -4450,61 +7232,61 @@ const EQController = {
             });
         }
     },
-    
+
     // Initialize knobs (bass boost, etc.)
     initKnobs() {
         if (!this.elements.bassKnobCanvas) {
             console.log('Bass knob canvas bulunamadı');
             return;
         }
-        
+
         const canvas = this.elements.bassKnobCanvas;
         if (typeof canvas.getContext !== 'function') {
             console.error('bassKnobCanvas geçerli bir canvas değil:', canvas);
             return;
         }
-        
+
         const ctx = canvas.getContext('2d');
         if (!ctx) {
             console.error('Canvas context alınamadı');
             return;
         }
-        
+
         // Draw initial state
         this.drawKnob(ctx, canvas, this.bassBoost / 100);
-        
+
         // Knob interaction
         let isDragging = false;
         let startY = 0;
         let startValue = 0;
-        
+
         canvas.addEventListener('mousedown', (e) => {
             isDragging = true;
             startY = e.clientY;
             startValue = this.bassBoost;
             canvas.style.cursor = 'grabbing';
         });
-        
+
         document.addEventListener('mousemove', (e) => {
             if (!isDragging) return;
-            
+
             const delta = (startY - e.clientY) * 0.5;
             let newValue = Math.max(0, Math.min(100, startValue + delta));
             this.setBassBoost(newValue);
             this.drawKnob(ctx, canvas, newValue / 100);
-            
+
             if (this.elements.bassKnobValue) {
                 this.elements.bassKnobValue.textContent = Math.round(newValue) + '%';
             }
         });
-        
+
         document.addEventListener('mouseup', () => {
             if (isDragging) {
                 isDragging = false;
                 canvas.style.cursor = 'pointer';
             }
         });
-        
+
         // Scroll to adjust
         canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
@@ -4512,22 +7294,22 @@ const EQController = {
             let newValue = Math.max(0, Math.min(100, this.bassBoost + delta));
             this.setBassBoost(newValue);
             this.drawKnob(ctx, canvas, newValue / 100);
-            
+
             if (this.elements.bassKnobValue) {
                 this.elements.bassKnobValue.textContent = Math.round(newValue) + '%';
             }
         });
     },
-    
+
     // Draw rotary knob
     drawKnob(ctx, canvas, value) {
         const size = canvas.width;
         const center = size / 2;
         const radius = size * 0.35;
-        
+
         // Clear
         ctx.clearRect(0, 0, size, size);
-        
+
         // Background ring
         ctx.beginPath();
         ctx.arc(center, center, radius + 8, 0.75 * Math.PI, 2.25 * Math.PI);
@@ -4535,23 +7317,23 @@ const EQController = {
         ctx.lineWidth = 6;
         ctx.lineCap = 'round';
         ctx.stroke();
-        
+
         // Value arc
         const startAngle = 0.75 * Math.PI;
         const endAngle = startAngle + (1.5 * Math.PI * value);
-        
+
         const gradient = ctx.createLinearGradient(0, size, size, 0);
         gradient.addColorStop(0, '#00d9ff');
         gradient.addColorStop(0.5, '#00aaff');
         gradient.addColorStop(1, '#0066ff');
-        
+
         ctx.beginPath();
         ctx.arc(center, center, radius + 8, startAngle, endAngle);
         ctx.strokeStyle = gradient;
         ctx.lineWidth = 6;
         ctx.lineCap = 'round';
         ctx.stroke();
-        
+
         // Knob body
         const knobGradient = ctx.createRadialGradient(
             center - 5, center - 5, 0,
@@ -4560,24 +7342,24 @@ const EQController = {
         knobGradient.addColorStop(0, '#3a3a4a');
         knobGradient.addColorStop(0.5, '#2a2a3a');
         knobGradient.addColorStop(1, '#1a1a2a');
-        
+
         ctx.beginPath();
         ctx.arc(center, center, radius, 0, Math.PI * 2);
         ctx.fillStyle = knobGradient;
         ctx.fill();
-        
+
         // Knob border
         ctx.beginPath();
         ctx.arc(center, center, radius, 0, Math.PI * 2);
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
         ctx.lineWidth = 1;
         ctx.stroke();
-        
+
         // Indicator line
         const angle = startAngle + (1.5 * Math.PI * value);
         const lineStart = radius * 0.4;
         const lineEnd = radius * 0.8;
-        
+
         ctx.beginPath();
         ctx.moveTo(
             center + Math.cos(angle) * lineStart,
@@ -4591,7 +7373,7 @@ const EQController = {
         ctx.lineWidth = 3;
         ctx.lineCap = 'round';
         ctx.stroke();
-        
+
         // Glow effect
         ctx.shadowColor = '#00d9ff';
         ctx.shadowBlur = 10;
@@ -4605,11 +7387,11 @@ const EQController = {
         ctx.fill();
         ctx.shadowBlur = 0;
     },
-    
+
     // Set individual band
     setBand(index, value) {
         this.bands[index] = value;
-        
+
         // Call native audio if available
         if (window.audioAPI?.eq?.setBand) {
             try {
@@ -4619,7 +7401,7 @@ const EQController = {
             }
         }
     },
-    
+
     // Set preamp
     setPreamp(value) {
         this.preamp = value;
@@ -4631,7 +7413,7 @@ const EQController = {
             }
         }
     },
-    
+
     // Set master volume
     setMasterVolume(value) {
         this.masterVolume = value;
@@ -4643,7 +7425,7 @@ const EQController = {
             }
         }
     },
-    
+
     // Set bass boost
     setBassBoost(value) {
         this.bassBoost = value;
@@ -4655,29 +7437,29 @@ const EQController = {
             }
         }
     },
-    
+
     // Apply preset
     applyPreset(presetKey) {
         const preset = this.presets[presetKey];
         if (!preset) return;
-        
+
         // Apply band values
         preset.bands.forEach((value, index) => {
             this.bands[index] = value;
-            
+
             const sliderData = this.elements.sliders[index];
             if (sliderData) {
                 sliderData.slider.value = value;
                 sliderData.valueDiv.textContent = value > 0 ? `+${value}` : value;
-                
+
                 sliderData.band.classList.remove('positive', 'negative');
                 if (value > 0) sliderData.band.classList.add('positive');
                 if (value < 0) sliderData.band.classList.add('negative');
             }
-            
+
             this.setBand(index, value);
         });
-        
+
         // Apply bass boost
         this.setBassBoost(preset.bassBoost);
         if (this.elements.bassKnobCanvas) {
@@ -4686,10 +7468,10 @@ const EQController = {
         }
         const bassValue = document.getElementById('bassBoostValue');
         if (bassValue) bassValue.textContent = preset.bassBoost + '%';
-        
+
         console.log(`🎵 Applied preset: ${preset.name}`);
     },
-    
+
     // Reset all to flat
     resetAll() {
         // Reset bands
@@ -4699,18 +7481,18 @@ const EQController = {
             valueDiv.textContent = '0';
             band.classList.remove('positive', 'negative');
         });
-        
+
         // Reset sliders
         if (this.elements.preampSlider) {
             this.elements.preampSlider.value = 0;
             document.getElementById('preampValue').textContent = '0 dB';
         }
-        
+
         if (this.elements.volumeSlider) {
             this.elements.volumeSlider.value = 100;
             document.getElementById('masterVolumeValue').textContent = '100%';
         }
-        
+
         // Reset bass
         this.bassBoost = 0;
         if (this.elements.bassKnobCanvas) {
@@ -4718,21 +7500,21 @@ const EQController = {
             this.drawKnob(ctx, this.elements.bassKnobCanvas, 0);
         }
         document.getElementById('bassBoostValue').textContent = '0%';
-        
+
         // Reset preset select
         if (this.elements.presetSelect) {
             this.elements.presetSelect.value = 'flat';
         }
-        
+
         // Apply to native
         this.bands.forEach((v, i) => this.setBand(i, 0));
         this.setPreamp(0);
         this.setMasterVolume(100);
         this.setBassBoost(0);
-        
+
         console.log('🎚️ EQ reset to flat');
     },
-    
+
     // Update EQ enabled state
     updateEQState() {
         if (window.audioAPI?.eq?.setEnabled) {
@@ -4742,12 +7524,12 @@ const EQController = {
                 console.warn('Could not set EQ state:', e);
             }
         }
-        
+
         if (this.elements.eqButton) {
             this.elements.eqButton.classList.toggle('active', this.enabled);
         }
     },
-    
+
     // Update auto-gain state
     updateAutoGain() {
         if (window.audioAPI?.setAutoGain) {
@@ -4758,7 +7540,7 @@ const EQController = {
             }
         }
     },
-    
+
     // Toggle modal
     toggleModal() {
         if (this.elements.modal?.classList.contains('active')) {
@@ -4767,7 +7549,7 @@ const EQController = {
             this.openModal();
         }
     },
-    
+
     // Open modal
     openModal() {
         if (this.elements.modal) {
@@ -4780,7 +7562,7 @@ const EQController = {
             }
         }
     },
-    
+
     // Close modal
     closeModal() {
         if (this.elements.modal) {
@@ -4788,7 +7570,7 @@ const EQController = {
             this.elements.modal.classList.add('hidden');
         }
     },
-    
+
     // Save settings to localStorage
     saveSettings() {
         const settings = {
@@ -4799,55 +7581,55 @@ const EQController = {
             enabled: this.enabled,
             autoGain: this.autoGain
         };
-        
+
         try {
             localStorage.setItem('aurivo_eq_settings', JSON.stringify(settings));
             console.log('💾 EQ settings saved');
-            
+
             // Show notification
             showNotification('EQ ayarları kaydedildi', 'success');
         } catch (e) {
             console.error('Failed to save EQ settings:', e);
         }
     },
-    
+
     // Load settings from localStorage
     loadSettings() {
         try {
             const saved = localStorage.getItem('aurivo_eq_settings');
             if (!saved) return;
-            
+
             const settings = JSON.parse(saved);
-            
+
             // Apply bands
             if (settings.bands) {
                 settings.bands.forEach((value, index) => {
                     this.bands[index] = value;
                     this.setBand(index, value);
-                    
+
                     const sliderData = this.elements.sliders[index];
                     if (sliderData) {
                         sliderData.slider.value = value;
                         sliderData.valueDiv.textContent = value > 0 ? `+${value}` : value;
-                        
+
                         sliderData.band.classList.remove('positive', 'negative');
                         if (value > 0) sliderData.band.classList.add('positive');
                         if (value < 0) sliderData.band.classList.add('negative');
                     }
                 });
             }
-            
+
             // Apply other settings
             if (settings.preamp !== undefined) {
                 this.preamp = settings.preamp;
                 this.setPreamp(settings.preamp);
                 if (this.elements.preampSlider) {
                     this.elements.preampSlider.value = settings.preamp;
-                    document.getElementById('preampValue').textContent = 
+                    document.getElementById('preampValue').textContent =
                         (settings.preamp > 0 ? '+' : '') + settings.preamp + ' dB';
                 }
             }
-            
+
             if (settings.masterVolume !== undefined) {
                 this.masterVolume = settings.masterVolume;
                 this.setMasterVolume(settings.masterVolume);
@@ -4856,13 +7638,13 @@ const EQController = {
                     document.getElementById('masterVolumeValue').textContent = settings.masterVolume + '%';
                 }
             }
-            
+
             if (settings.bassBoost !== undefined) {
                 this.bassBoost = settings.bassBoost;
                 this.setBassBoost(settings.bassBoost);
                 document.getElementById('bassBoostValue').textContent = settings.bassBoost + '%';
             }
-            
+
             if (settings.enabled !== undefined) {
                 this.enabled = settings.enabled;
                 if (this.elements.enableToggle) {
@@ -4870,20 +7652,20 @@ const EQController = {
                 }
                 this.updateEQState();
             }
-            
+
             if (settings.autoGain !== undefined) {
                 this.autoGain = settings.autoGain;
                 if (this.elements.autoGainToggle) {
                     this.elements.autoGainToggle.checked = settings.autoGain;
                 }
             }
-            
+
             console.log('📂 EQ settings loaded');
         } catch (e) {
             console.error('Failed to load EQ settings:', e);
         }
     },
-    
+
     // Update level meters (call from audio loop)
     updateLevels(leftLevel, rightLevel) {
         const bars = this.elements.levelBars;
@@ -4891,25 +7673,25 @@ const EQController = {
             bars[0].style.setProperty('--level', `${leftLevel * 100}%`);
             bars[1].style.setProperty('--level', `${rightLevel * 100}%`);
         }
-        
+
         // Check clipping
         if (this.elements.clippingLed) {
             const isClipping = leftLevel > 0.95 || rightLevel > 0.95;
             this.elements.clippingLed.classList.toggle('active', isClipping);
         }
     },
-    
+
     // ============================================
     // PRESET MANAGER FUNCTIONS
     // ============================================
-    
+
     // Open save preset modal
     openSavePresetModal() {
         if (!this.elements.savePresetModal) return;
-        
+
         // Update preview
         this.updatePresetPreview();
-        
+
         // Clear input fields
         if (this.elements.presetNameInput) {
             this.elements.presetNameInput.value = '';
@@ -4918,17 +7700,17 @@ const EQController = {
         if (this.elements.presetDescInput) {
             this.elements.presetDescInput.value = '';
         }
-        
+
         this.elements.savePresetModal.classList.add('active');
     },
-    
+
     // Close save preset modal
     closeSavePresetModal() {
         if (this.elements.savePresetModal) {
             this.elements.savePresetModal.classList.remove('active');
         }
     },
-    
+
     // Update preset preview
     updatePresetPreview() {
         // Bass boost value
@@ -4936,39 +7718,39 @@ const EQController = {
         if (bassPreview) {
             bassPreview.textContent = Math.round(this.bassBoost) + '%';
         }
-        
+
         // Preamp value
         const preampPreview = document.getElementById('previewPreamp');
         if (preampPreview) {
             const val = this.preamp;
             preampPreview.textContent = (val > 0 ? '+' : '') + val + ' dB';
         }
-        
+
         // Active bands count
         const activeBandsPreview = document.getElementById('previewActiveBands');
         if (activeBandsPreview) {
             const activeBands = this.bands.filter(b => b !== 0).length;
             activeBandsPreview.textContent = `${activeBands}/32`;
         }
-        
+
         // Mini EQ preview
         this.drawMiniEqPreview();
     },
-    
+
     // Draw mini EQ preview
     drawMiniEqPreview() {
         const container = document.getElementById('miniEqPreview');
         if (!container) return;
-        
+
         container.innerHTML = '';
-        
+
         this.bands.forEach((value, index) => {
             const bar = document.createElement('div');
             bar.className = 'mini-eq-bar';
-            
+
             const height = Math.abs(value) * 4; // Max 48px for ±12dB
             const isPositive = value >= 0;
-            
+
             bar.style.cssText = `
                 width: 6px;
                 height: ${height}px;
@@ -4979,11 +7761,11 @@ const EQController = {
                 ${isPositive ? 'bottom: 50%' : 'top: 50%'};
                 opacity: ${value === 0 ? 0.2 : 0.8};
             `;
-            
+
             container.appendChild(bar);
         });
     },
-    
+
     // Save custom preset
     saveCustomPreset() {
         const name = this.elements.presetNameInput?.value.trim();
@@ -4992,10 +7774,10 @@ const EQController = {
             this.elements.presetNameInput?.focus();
             return;
         }
-        
+
         // Generate unique key
         const key = 'custom_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_') + '_' + Date.now();
-        
+
         // Create preset object
         const preset = {
             name: name,
@@ -5006,111 +7788,111 @@ const EQController = {
             createdAt: new Date().toISOString(),
             isCustom: true
         };
-        
+
         // Save to custom presets
         this.customPresets[key] = preset;
         this.saveCustomPresets();
-        
+
         // Update dropdown
         this.populatePresetSelect();
-        
+
         // Select the new preset
         if (this.elements.presetSelect) {
             this.elements.presetSelect.value = key;
         }
         this.currentPreset = key;
-        
+
         // Close modal
         this.closeSavePresetModal();
-        
+
         showNotification(`"${name}" preset kaydedildi`, 'success');
         console.log(`💾 Custom preset saved: ${name}`);
     },
-    
+
     // Open preset manager
     openPresetManager() {
         if (!this.elements.presetManagerModal) return;
-        
+
         // Populate lists
         this.populateFactoryPresetList();
         this.populateCustomPresetList();
-        
+
         // Switch to factory tab by default
         this.switchPresetTab('factory');
-        
+
         this.elements.presetManagerModal.classList.add('active');
     },
-    
+
     // Close preset manager
     closePresetManager() {
         if (this.elements.presetManagerModal) {
             this.elements.presetManagerModal.classList.remove('active');
         }
     },
-    
+
     // Switch preset tab
     switchPresetTab(tab) {
         // Update tab buttons
         document.querySelectorAll('.preset-tab').forEach(t => {
             t.classList.toggle('active', t.dataset.tab === tab);
         });
-        
+
         // Update lists
         const factoryList = document.getElementById('factoryPresetList');
         const customList = document.getElementById('customPresetList');
-        
+
         if (factoryList) factoryList.classList.toggle('hidden', tab !== 'factory');
         if (customList) customList.classList.toggle('hidden', tab !== 'custom');
     },
-    
+
     // Populate factory preset list
     populateFactoryPresetList() {
         const container = this.elements.factoryPresetList;
         if (!container) return;
-        
+
         container.innerHTML = '';
-        
+
         Object.entries(this.factoryPresets).forEach(([key, preset]) => {
             const item = this.createPresetListItem(key, preset, false);
             container.appendChild(item);
         });
     },
-    
+
     // Populate custom preset list
     populateCustomPresetList() {
         const container = this.elements.customPresetList;
         if (!container) return;
-        
+
         const customKeys = Object.keys(this.customPresets);
         const emptyState = document.getElementById('noCustomPresets');
-        
+
         // Clear existing items (except empty state)
         container.querySelectorAll('.preset-list-item').forEach(el => el.remove());
-        
+
         if (customKeys.length === 0) {
             if (emptyState) emptyState.classList.remove('hidden');
             return;
         }
-        
+
         if (emptyState) emptyState.classList.add('hidden');
-        
+
         customKeys.forEach(key => {
             const preset = this.customPresets[key];
             const item = this.createPresetListItem(key, preset, true);
             container.appendChild(item);
         });
     },
-    
+
     // Create preset list item
     createPresetListItem(key, preset, isCustom) {
         const item = document.createElement('div');
         item.className = 'preset-list-item';
         item.dataset.key = key;
-        
+
         // Calculate stats
         const activeBands = preset.bands.filter(b => b !== 0).length;
         const avgGain = preset.bands.reduce((a, b) => a + b, 0) / preset.bands.length;
-        
+
         item.innerHTML = `
             <div class="preset-item-info">
                 <div class="preset-item-name">${preset.name}</div>
@@ -5141,7 +7923,7 @@ const EQController = {
                 ` : ''}
             </div>
         `;
-        
+
         // Event listeners
         const applyBtn = item.querySelector('.apply-btn');
         if (applyBtn) {
@@ -5154,33 +7936,33 @@ const EQController = {
                 showNotification(`"${preset.name}" uygulandı`, 'success');
             });
         }
-        
+
         if (isCustom) {
             const editBtn = item.querySelector('.edit-btn');
             if (editBtn) {
                 editBtn.addEventListener('click', () => this.editCustomPreset(key));
             }
-            
+
             const deleteBtn = item.querySelector('.delete-btn');
             if (deleteBtn) {
                 deleteBtn.addEventListener('click', () => this.deleteCustomPreset(key));
             }
         }
-        
+
         return item;
     },
-    
+
     // Edit custom preset
     editCustomPreset(key) {
         const preset = this.customPresets[key];
         if (!preset) return;
-        
+
         // Apply preset values to EQ
         this.applyPreset(key);
-        
+
         // Open save modal with current values
         this.openSavePresetModal();
-        
+
         // Pre-fill name and description
         if (this.elements.presetNameInput) {
             this.elements.presetNameInput.value = preset.name;
@@ -5188,13 +7970,13 @@ const EQController = {
         if (this.elements.presetDescInput) {
             this.elements.presetDescInput.value = preset.description || '';
         }
-        
+
         // Delete old preset when saving
         const oldConfirmHandler = document.getElementById('confirmSavePreset');
         if (oldConfirmHandler) {
             const newHandler = oldConfirmHandler.cloneNode(true);
             oldConfirmHandler.parentNode.replaceChild(newHandler, oldConfirmHandler);
-            
+
             newHandler.addEventListener('click', () => {
                 // Delete old preset first
                 delete this.customPresets[key];
@@ -5205,18 +7987,18 @@ const EQController = {
             });
         }
     },
-    
+
     // Delete custom preset
     deleteCustomPreset(key) {
         const preset = this.customPresets[key];
         if (!preset) return;
-        
+
         if (confirm(`"${preset.name}" presetini silmek istediğinize emin misiniz?`)) {
             delete this.customPresets[key];
             this.saveCustomPresets();
             this.populatePresetSelect();
             this.populateCustomPresetList();
-            
+
             // If this was the current preset, switch to flat
             if (this.currentPreset === key) {
                 this.currentPreset = 'flat';
@@ -5224,11 +8006,11 @@ const EQController = {
                     this.elements.presetSelect.value = 'flat';
                 }
             }
-            
+
             showNotification(`"${preset.name}" silindi`, 'info');
         }
     },
-    
+
     // Export presets to JSON file
     exportPresets() {
         const exportData = {
@@ -5236,10 +8018,10 @@ const EQController = {
             exportDate: new Date().toISOString(),
             customPresets: this.customPresets
         };
-        
+
         const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
-        
+
         const a = document.createElement('a');
         a.href = url;
         a.download = `aurivo_eq_presets_${Date.now()}.json`;
@@ -5247,24 +8029,24 @@ const EQController = {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        
+
         showNotification('Presetler dışa aktarıldı', 'success');
     },
-    
+
     // Import presets from JSON file
     importPresets(event) {
         const file = event.target.files[0];
         if (!file) return;
-        
+
         const reader = new FileReader();
         reader.onload = (e) => {
             try {
                 const data = JSON.parse(e.target.result);
-                
+
                 if (!data.customPresets || typeof data.customPresets !== 'object') {
                     throw new Error('Geçersiz preset dosyası');
                 }
-                
+
                 // Merge with existing presets
                 let importedCount = 0;
                 Object.entries(data.customPresets).forEach(([key, preset]) => {
@@ -5279,7 +8061,7 @@ const EQController = {
                         importedCount++;
                     }
                 });
-                
+
                 if (importedCount > 0) {
                     this.saveCustomPresets();
                     this.populatePresetSelect();
@@ -5288,15 +8070,15 @@ const EQController = {
                 } else {
                     showNotification('İçe aktarılacak geçerli preset bulunamadı', 'warning');
                 }
-                
+
             } catch (err) {
                 console.error('Import error:', err);
                 showNotification('Dosya okunamadı: ' + err.message, 'error');
             }
         };
-        
+
         reader.readAsText(file);
-        
+
         // Reset file input
         event.target.value = '';
     }
@@ -5319,7 +8101,7 @@ const AGCController = {
         releaseTime: 50,             // 50ms release
         limiterThreshold: 0.98,      // Hard limiter at 98%
     },
-    
+
     // State
     state: {
         isRunning: false,
@@ -5329,7 +8111,7 @@ const AGCController = {
         totalGainReductions: 0,
         sessionClippingEvents: 0,
     },
-    
+
     // UI Elements
     elements: {
         toggle: null,
@@ -5338,20 +8120,20 @@ const AGCController = {
         peakMeter: null,
         clippingLed: null,
     },
-    
+
     // Initialize AGC Controller
     init() {
         this.cacheElements();
         this.setupEventListeners();
         this.loadSettings();
-        
+
         if (this.config.enabled) {
             this.start();
         }
-        
+
         console.log('🎚️ AGC Controller initialized');
     },
-    
+
     // Cache DOM elements
     cacheElements() {
         this.elements.toggle = document.getElementById('autoGainToggle');
@@ -5360,7 +8142,7 @@ const AGCController = {
         this.elements.peakMeter = document.getElementById('peakMeter');
         this.elements.clippingLed = document.getElementById('clipLed');
     },
-    
+
     // Setup event listeners
     setupEventListeners() {
         // Toggle listener is handled in EQController
@@ -5371,37 +8153,37 @@ const AGCController = {
             });
         }
     },
-    
+
     // Start AGC monitoring
     start() {
         if (this.state.isRunning) return;
-        
+
         this.state.isRunning = true;
         this.state.intervalId = setInterval(() => this.checkLevels(), this.config.checkInterval);
-        
+
         // Send AGC parameters to native
         this.updateNativeParameters();
-        
+
         console.log('🔊 AGC monitoring started');
     },
-    
+
     // Stop AGC monitoring
     stop() {
         if (!this.state.isRunning) return;
-        
+
         this.state.isRunning = false;
         if (this.state.intervalId) {
             clearInterval(this.state.intervalId);
             this.state.intervalId = null;
         }
-        
+
         console.log('🔇 AGC monitoring stopped');
     },
-    
+
     // Enable/disable AGC
     setEnabled(enabled) {
         this.config.enabled = enabled;
-        
+
         // Update native AGC
         if (window.audioAPI?.agc?.setEnabled) {
             try {
@@ -5410,26 +8192,26 @@ const AGCController = {
                 console.warn('Native AGC not available:', e);
             }
         }
-        
+
         if (enabled) {
             this.start();
         } else {
             this.stop();
         }
-        
+
         // Save setting
         this.saveSettings();
-        
+
         // Update UI
         if (this.elements.toggle) {
             this.elements.toggle.checked = enabled;
         }
     },
-    
+
     // Update native AGC parameters
     updateNativeParameters() {
         if (!window.audioAPI?.agc?.setParameters) return;
-        
+
         try {
             window.audioAPI.agc.setParameters({
                 attackMs: this.config.attackTime,
@@ -5440,12 +8222,12 @@ const AGCController = {
             console.warn('Could not set AGC parameters:', e);
         }
     },
-    
+
     // Main level checking function - called every 100ms
     checkLevels() {
         if (!this.config.enabled) return;
         if (!state.isPlaying) return; // Only check when playing
-        
+
         // Get AGC status from native
         let agcStatus = null;
         if (window.audioAPI?.agc?.getStatus) {
@@ -5455,7 +8237,7 @@ const AGCController = {
                 // Native not available, try channel levels
             }
         }
-        
+
         // Fallback to basic level checking
         if (!agcStatus && window.audioAPI?.spectrum?.getChannelLevels) {
             try {
@@ -5471,58 +8253,58 @@ const AGCController = {
                 return; // Can't check levels
             }
         }
-        
+
         if (!agcStatus) return;
-        
+
         // Update UI meters
         this.updateMeters(agcStatus);
-        
+
         // Check for clipping
         if (agcStatus.isClipping || agcStatus.peakLevel > this.config.peakThreshold) {
             this.handleClipping(agcStatus);
         }
-        
+
         // Check for sustained low levels
         this.checkLowLevels(agcStatus);
     },
-    
+
     // Update visual meters
     updateMeters(status) {
         // Update level bars in EQ modal
         if (EQController?.elements?.levelBars?.length >= 2) {
             EQController.updateLevels(status.peakLevel, status.peakLevel);
         }
-        
+
         // Update clipping LED
         if (this.elements.clippingLed) {
             this.elements.clippingLed.classList.toggle('active', status.isClipping);
         }
-        
+
         // Update peak label
         const peakLabel = document.getElementById('peakLabel');
         if (peakLabel) {
             const peakDB = status.peakLevel > 0 ? (20 * Math.log10(status.peakLevel)).toFixed(1) : '-∞';
             peakLabel.textContent = `${peakDB} dB`;
-            peakLabel.style.color = status.peakLevel > 0.9 ? '#ff4444' : 
-                                    status.peakLevel > 0.7 ? '#ffaa00' : '#00ff88';
+            peakLabel.style.color = status.peakLevel > 0.9 ? '#ff4444' :
+                status.peakLevel > 0.7 ? '#ffaa00' : '#00ff88';
         }
     },
-    
+
     // Handle clipping events
     handleClipping(status) {
         const now = Date.now();
-        
+
         // Prevent spam - only warn every 2 seconds
         if (now - this.state.lastClippingWarning < 2000) return;
-        
+
         this.state.lastClippingWarning = now;
         this.state.sessionClippingEvents++;
-        
+
         console.warn(`⚠️ Clipping detected! Peak: ${(status.peakLevel * 100).toFixed(1)}%`);
-        
+
         // Apply emergency reduction
         this.applyEmergencyReduction();
-        
+
         // Show warning notification
         showNotification(
             'Ses seviyesi çok yüksek, otomatik azaltma uygulandı',
@@ -5530,11 +8312,11 @@ const AGCController = {
             3000
         );
     },
-    
+
     // Apply emergency gain reduction
     applyEmergencyReduction() {
         this.state.totalGainReductions++;
-        
+
         // Try native emergency reduction first
         if (window.audioAPI?.agc?.applyEmergencyReduction) {
             try {
@@ -5544,14 +8326,14 @@ const AGCController = {
                 // Fall through to JS implementation
             }
         }
-        
+
         // JS fallback: reduce all EQ bands by 1dB
         if (EQController) {
             EQController.bands.forEach((value, index) => {
                 const newValue = Math.max(-15, value - 1);
                 EQController.bands[index] = newValue;
                 EQController.setBand(index, newValue);
-                
+
                 // Update slider
                 const sliderData = EQController.elements.sliders[index];
                 if (sliderData) {
@@ -5559,12 +8341,12 @@ const AGCController = {
                     sliderData.valueDiv.textContent = newValue > 0 ? `+${newValue}` : newValue;
                 }
             });
-            
+
             // Reduce preamp by 0.5dB
             const newPreamp = Math.max(-12, EQController.preamp - 0.5);
             EQController.preamp = newPreamp;
             EQController.setPreamp(newPreamp);
-            
+
             if (EQController.elements.preampSlider) {
                 EQController.elements.preampSlider.value = newPreamp;
                 const preampDisplay = document.getElementById('preampValue');
@@ -5574,7 +8356,7 @@ const AGCController = {
             }
         }
     },
-    
+
     // Check for sustained low levels and suggest preamp increase
     checkLowLevels(status) {
         if (status.peakLevel < this.config.lowLevelThreshold) {
@@ -5583,7 +8365,7 @@ const AGCController = {
                 this.state.lowLevelStartTime = Date.now();
             } else {
                 const lowDuration = Date.now() - this.state.lowLevelStartTime;
-                
+
                 // If low for configured duration, suggest increase
                 if (lowDuration >= this.config.lowLevelDuration) {
                     this.suggestPreampIncrease();
@@ -5595,7 +8377,7 @@ const AGCController = {
             this.state.lowLevelStartTime = null;
         }
     },
-    
+
     // Suggest preamp increase to user
     suggestPreampIncrease() {
         // Only suggest if preamp is below max
@@ -5609,13 +8391,13 @@ const AGCController = {
                     // Use default
                 }
             }
-            
+
             if (suggestion > 0) {
                 // Auto-apply small increase
                 const newPreamp = Math.min(12, EQController.preamp + suggestion);
                 EQController.preamp = newPreamp;
                 EQController.setPreamp(newPreamp);
-                
+
                 // Update UI
                 if (EQController.elements.preampSlider) {
                     EQController.elements.preampSlider.value = newPreamp;
@@ -5624,12 +8406,12 @@ const AGCController = {
                         preampDisplay.textContent = (newPreamp > 0 ? '+' : '') + newPreamp.toFixed(1) + ' dB';
                     }
                 }
-                
+
                 console.log(`📈 Auto-increased preamp by +${suggestion.toFixed(1)}dB`);
             }
         }
     },
-    
+
     // Get AGC statistics
     getStats() {
         return {
@@ -5640,12 +8422,12 @@ const AGCController = {
             config: { ...this.config }
         };
     },
-    
+
     // Reset statistics
     resetStats() {
         this.state.totalGainReductions = 0;
         this.state.sessionClippingEvents = 0;
-        
+
         // Reset native clipping count
         if (window.audioAPI?.agc?.resetClippingCount) {
             try {
@@ -5655,7 +8437,7 @@ const AGCController = {
             }
         }
     },
-    
+
     // Save settings
     saveSettings() {
         try {
@@ -5669,7 +8451,7 @@ const AGCController = {
             console.error('Could not save AGC settings:', e);
         }
     },
-    
+
     // Load settings
     loadSettings() {
         try {
@@ -5695,4 +8477,3 @@ document.addEventListener('DOMContentLoaded', () => {
         AGCController.init();
     }, 100);
 });
-

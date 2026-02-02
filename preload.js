@@ -6,8 +6,9 @@
 
 console.log('[PRELOAD] Script başlıyor...');
 
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, clipboard } = require('electron');
 const path = require('path');
+const os = require('os');
 
 console.log('[PRELOAD] Electron modülleri yüklendi');
 
@@ -573,7 +574,7 @@ const createAudioAPI = () => {
 const aurivoAPI = {
     // Dosya Sistemi
     openFile: () => ipcRenderer.invoke('dialog:openFile'),
-    openFolder: () => ipcRenderer.invoke('dialog:openFolder'),
+    openFolder: (opts) => ipcRenderer.invoke('dialog:openFolder', opts),
     readDirectory: (dirPath) => ipcRenderer.invoke('fs:readDirectory', dirPath),
     getSpecialPaths: () => ipcRenderer.invoke('fs:getSpecialPaths'),
     fileExists: (filePath) => ipcRenderer.invoke('fs:exists', filePath),
@@ -592,8 +593,45 @@ const aurivoAPI = {
 
     // Dialog API
     dialog: {
-        openFolder: () => ipcRenderer.invoke('dialog:openFolder'),
+        openFolder: (opts) => ipcRenderer.invoke('dialog:openFolder', opts),
         openFiles: (filters) => ipcRenderer.invoke('dialog:openFiles', filters)
+    },
+
+    // Clipboard API (URL otomatik yapıştırma için)
+    clipboard: {
+        getText: () => {
+            try { return clipboard.readText(); } catch { return ''; }
+        },
+        setText: (text) => {
+            try { clipboard.writeText(String(text ?? '')); return true; } catch { return false; }
+        }
+    },
+
+    // Download API (Aurivo-Dawlod / yt-dlp)
+    download: {
+        start: (options) => ipcRenderer.invoke('download:start', options),
+        cancel: (id) => ipcRenderer.invoke('download:cancel', id),
+        onLog: (callback) => {
+            const handler = (_event, payload) => callback(payload);
+            ipcRenderer.on('download:log', handler);
+            return () => ipcRenderer.removeListener('download:log', handler);
+        },
+        onProgress: (callback) => {
+            const handler = (_event, payload) => callback(payload);
+            ipcRenderer.on('download:progress', handler);
+            return () => ipcRenderer.removeListener('download:progress', handler);
+        },
+        onDone: (callback) => {
+            const handler = (_event, payload) => callback(payload);
+            ipcRenderer.on('download:done', handler);
+            return () => ipcRenderer.removeListener('download:done', handler);
+        }
+    },
+
+    // Web Security / Privacy helpers
+    webSecurity: {
+        openExternal: (url) => ipcRenderer.invoke('web:openExternal', url),
+        clearData: (options) => ipcRenderer.invoke('web:clearData', options)
     },
 
     // C++ AUDIO ENGINE API (IPC-Based)
@@ -630,10 +668,43 @@ const aurivoAPI = {
         isMaximized: () => ipcRenderer.invoke('window:isMaximized')
     },
 
+    // SYSTEM TRAY MEDIA CONTROL LISTENER
+    onMediaControl: (callback) => {
+        ipcRenderer.on('media-control', (event, action) => callback(action));
+    },
+
+    // TRAY'E PLAYBACK STATE GÖNDER
+    updateTrayState: (state) => ipcRenderer.send('update-tray-state', state),
+
+    // MPRIS'E METADATA GÖNDER (Linux ortam oynatıcısı)
+    updateMPRISMetadata: (metadata) => ipcRenderer.send('update-mpris-metadata', metadata),
+
+    // MPRIS SEEK listener
+    onMPRISSeek: (callback) => {
+        ipcRenderer.on('mpris-seek', (event, offset) => callback(offset));
+    },
+
+    // MPRIS POSITION listener
+    onMPRISPosition: (callback) => {
+        ipcRenderer.on('mpris-position', (event, position) => callback(position));
+    },
+
     // Platform & Version Info
     platform: process.platform,
     version: '2.1.0',
-    isNativeAudioAvailable: isNativeAvailable
+    isNativeAudioAvailable: isNativeAvailable,
+    
+    // System Paths API
+    getHomeDir: () => os.homedir(),
+    getUserName: () => os.userInfo().username,
+    
+    // Path utilities
+    path: {
+        join: (...args) => path.join(...args),
+        basename: (p) => path.basename(p),
+        dirname: (p) => path.dirname(p),
+        resolve: (...args) => path.resolve(...args)
+    }
 };
 
 console.log('[PRELOAD] aurivoAPI objesi oluşturuldu');

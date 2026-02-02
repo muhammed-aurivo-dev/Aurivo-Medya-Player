@@ -15,6 +15,11 @@ native/build/
 build-visualizer/
 visualizer/build/
 
+# Python
+venv/
+.venv/
+__pycache__/
+
 # Misc
 .DS_Store
 .env

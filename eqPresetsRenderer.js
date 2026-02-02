@@ -374,7 +374,31 @@ function focusSelected() {
     const sel = state.selected;
     const rows = Array.from(list.querySelectorAll('.preset-item'));
     const row = rows.find(r => r?.dataset?.filename === sel);
-    if (row) row.scrollIntoView({ block: 'center' });
+    if (!row) return;
+
+    // Ensure highlight is applied (virtual list can re-render)
+    selectPreset(sel);
+
+    // Robust scrolling: scroll the list container (not the window)
+    const scrollToCenter = () => {
+        const top = row.offsetTop - (list.clientHeight / 2) + (row.offsetHeight / 2);
+        const maxTop = Math.max(0, list.scrollHeight - list.clientHeight);
+        list.scrollTop = Math.min(maxTop, Math.max(0, top));
+    };
+
+    // Wait 1-2 frames for layout after incremental render
+    requestAnimationFrame(() => requestAnimationFrame(scrollToCenter));
+}
+
+function ensureSelectedNotFilteredOut() {
+    if (!state.selected) return;
+    const inFiltered = state.filtered.some(p => p?.filename === state.selected);
+    if (inFiltered) return;
+
+    // If the selected preset is hidden due to group filtering, fall back to "all"
+    state.selectedGroup = 'all';
+    const groupSel = document.getElementById('presetGroup');
+    if (groupSel) groupSel.value = 'all';
 }
 
 function renderList(presets) {
@@ -400,6 +424,7 @@ async function runSearch(query) {
     // Boş arama: tüm liste (Öne çıkanlar + tüm AutoEQ)
     if (!q) {
         renderList(filterByGroup(state.all));
+        ensureSelectedNotFilteredOut();
         focusSelected();
         return;
     }
@@ -424,6 +449,7 @@ async function runSearch(query) {
     }
 
     renderList(filterByGroup(merged));
+    ensureSelectedNotFilteredOut();
     focusSelected();
 }
 
@@ -476,12 +502,14 @@ async function init() {
         renderList(filterByGroup(state.all));
         if (!state.selected) state.selected = '__flat__';
         selectPreset(state.selected);
+        ensureSelectedNotFilteredOut();
         focusSelected();
     } catch {
         setStatus('AutoEQ yüklenemedi (loglara bakın).');
         renderList(state.featured);
         if (!state.selected) state.selected = '__flat__';
         selectPreset(state.selected);
+        ensureSelectedNotFilteredOut();
         focusSelected();
     }
 

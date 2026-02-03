@@ -221,6 +221,9 @@ function cacheElements() {
     elements.settingsBtn = document.getElementById('settingsBtn');
     elements.securityBtn = document.getElementById('securityBtn');
     elements.infoBtn = document.getElementById('infoBtn');
+    elements.aboutModalOverlay = document.getElementById('aboutModalOverlay');
+    elements.aboutCloseBtn = document.getElementById('aboutCloseBtn');
+    elements.aboutGithubBtn = document.getElementById('aboutGithubBtn');
 
     // Panels
     elements.leftPanel = document.getElementById('leftPanel');
@@ -488,6 +491,26 @@ function setupEventListeners() {
     if (elements.settingsBtn) elements.settingsBtn.addEventListener('click', openSettings);
     if (elements.securityBtn) elements.securityBtn.addEventListener('click', openSecurity);
     if (elements.infoBtn) elements.infoBtn.addEventListener('click', showAbout);
+    if (elements.aboutCloseBtn) elements.aboutCloseBtn.addEventListener('click', closeAboutModal);
+    if (elements.aboutGithubBtn) {
+        elements.aboutGithubBtn.addEventListener('click', async () => {
+            const url = 'https://github.com/muhammeddali1453-beep/Aurivo-Medya-Player';
+            try {
+                if (window.aurivo?.webSecurity?.openExternal) {
+                    await window.aurivo.webSecurity.openExternal(url);
+                } else {
+                    window.open(url, '_blank', 'noopener');
+                }
+            } catch (e) {
+                console.error('[About] GitHub link açılamadı:', e);
+            }
+        });
+    }
+    if (elements.aboutModalOverlay) {
+        elements.aboutModalOverlay.addEventListener('click', (e) => {
+            if (e.target === elements.aboutModalOverlay) closeAboutModal();
+        });
+    }
 
     // Web Platforms
     elements.platformBtns.forEach(btn => {
@@ -5118,13 +5141,39 @@ function resetPlaybackDefaults() {
 }
 
 function showAbout() {
-    alert('Aurivo Media Player\nVersion 1.0.0\n\nModern medya oynatıcı');
+    openAboutModal();
+}
+
+function isAboutModalOpen() {
+    return Boolean(elements.aboutModalOverlay && !elements.aboutModalOverlay.classList.contains('hidden'));
+}
+
+function openAboutModal() {
+    if (!elements.aboutModalOverlay) return;
+    elements.aboutModalOverlay.classList.remove('hidden');
+    requestAnimationFrame(() => {
+        elements.aboutCloseBtn?.focus?.();
+    });
+}
+
+function closeAboutModal() {
+    if (!elements.aboutModalOverlay) return;
+    elements.aboutModalOverlay.classList.add('hidden');
 }
 
 // ============================================
 // KEYBOARD SHORTCUTS
 // ============================================
 function handleKeyboard(e) {
+    // About modal açıksa önce onu kapat
+    if (isAboutModalOpen()) {
+        if (e.code === 'Escape') {
+            e.preventDefault();
+            closeAboutModal();
+        }
+        return;
+    }
+
     // Utility sayfalar açıkken klavye kısayollarını devre dışı bırak
     if (isPageVisible(elements.settingsPage) || isPageVisible(elements.downloadPage) || isPageVisible(elements.securityPage)) return;
 

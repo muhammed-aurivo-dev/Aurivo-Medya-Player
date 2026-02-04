@@ -1,10 +1,10 @@
 {
   "name": "aurivo-media-player",
-  "version": "1.0.0",
+  "version": "4.0.14",
   "description": "Aurivo Media Player - Electron App",
   "main": "main.js",
   "scripts": {
-    "start": "ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_WAYLAND=1 OZONE_PLATFORM=wayland electron .",
+    "start": "electron .",
     "dev": "AURIVO_DEV=1 ELECTRON_OZONE_PLATFORM_HINT=wayland ELECTRON_ENABLE_WAYLAND=1 OZONE_PLATFORM=wayland electron . --enable-logging",
     "install:desktop:linux": "bash scripts/install-desktop-linux.sh",
     "gen:icon:transparent": "bash scripts/generate-transparent-icon.sh",
@@ -15,17 +15,16 @@
     "build:linux": "node native/copy-libs.js linux && electron-builder --linux",
     "build:win": "node native/copy-libs.js win32 && echo '⚠️  Windows ffmpeg binary gerekli: third_party/ffmpeg/ffmpeg.exe' && electron-builder --win",
     "build:win:zip": "node native/copy-libs.js win32 && echo '⚠️  Windows ffmpeg binary gerekli: third_party/ffmpeg/ffmpeg.exe' && electron-builder --win zip",
-    "build:mac": "node native/copy-libs.js darwin && electron-builder --mac"
+    "build:mac": "node native/copy-libs.js darwin && electron-builder --mac",
+    "dist": "electron-builder --win --x64"
   },
-  "author": {
-    "name": "Aurivo",
-    "email": "support@aurivo.app"
-  },
+  "author": "Muhammet Dali",
   "homepage": "https://aurivo.app",
   "license": "MIT",
   "build": {
     "appId": "com.aurivo.mediaplayer",
     "productName": "Aurivo Media Player",
+    "electronVersion": "28.3.3",
     "icon": "icons/aurivo_alt_boldA_transparent_1024.png",
     "artifactName": "Aurivo-${version}-${os}-${arch}.${ext}",
     "files": [
@@ -92,8 +91,7 @@
     },
     "win": {
       "target": [
-        "nsis",
-        "zip"
+        "nsis"
       ],
       "icon": "icons/aurivo.ico",
       "executableName": "Aurivo",
@@ -139,6 +137,7 @@
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,

@@ -9,6 +9,7 @@ console.log('[PRELOAD] Script başlıyor...');
 const { contextBridge, ipcRenderer, clipboard } = require('electron');
 const path = require('path');
 const os = require('os');
+const { pathToFileURL } = require('url');
 
 console.log('[PRELOAD] Electron modülleri yüklendi');
 
@@ -713,7 +714,14 @@ const aurivoAPI = {
         join: (...args) => path.join(...args),
         basename: (p) => path.basename(p),
         dirname: (p) => path.dirname(p),
-        resolve: (...args) => path.resolve(...args)
+        resolve: (...args) => path.resolve(...args),
+        toFileUrl: (p) => {
+            try {
+                return pathToFileURL(String(p || '')).toString();
+            } catch {
+                return '';
+            }
+        }
     }
 };
 

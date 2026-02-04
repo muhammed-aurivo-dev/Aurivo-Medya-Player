@@ -62,18 +62,10 @@ const state = {
     webAlbum: ''
 };
 
-// Desteklenen ses formatları - BASS Audio Library destekli tüm formatlar
+// Desteklenen ses formatları (kütüphane tarama filtresi)
+// Not: uzantı kontrolü her yerde `toLowerCase()` ile yapılır.
 const AUDIO_EXTENSIONS = [
-    // Yaygın formatlar
-    'mp3', 'wav', 'flac', 'ogg', 'aac', 'm4a', 'wma', 'opus',
-    // Yüksek kalite / Lossless
-    'aiff', 'aif', 'alac', 'ape', 'wv', 'tta', 'tak',
-    // Diğer formatlar
-    'mka', 'mpc', 'shn', 'ac3', 'dts', 'dsf', 'dff',
-    // Eski/Nadir formatlar
-    'mid', 'midi', 'mod', 'xm', 'it', 's3m', 'mtm', 'umx',
-    // Web formatları
-    'webm', 'spx', 'caf'
+    'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'opus', 'wma', 'aiff'
 ];
 
 // Video formatları (ileride kullanılabilir)
@@ -3796,7 +3788,7 @@ function playVideo(videoPath) {
     switchPage('video');
 
     // Video player'ı ayarla ve oynat
-    elements.videoPlayer.src = 'file://' + videoPath;
+    elements.videoPlayer.src = window.aurivo?.path?.toFileUrl?.(videoPath) || ('file://' + videoPath);
 
     // Video ses seviyesini ayarla (kaydedilen seviye)
     elements.videoPlayer.volume = state.volume / 100;
@@ -3961,7 +3953,7 @@ async function playIndex(index) {
 // HTML5 Audio ile oynat (fallback)
 function playWithHTML5Audio(item) {
     const activePlayer = getActiveAudioPlayer();
-    const encodedPath = encodeURI('file://' + item.path).replace(/#/g, '%23');
+    const encodedPath = window.aurivo?.path?.toFileUrl?.(item.path) || encodeURI('file://' + item.path).replace(/#/g, '%23');
     activePlayer.src = encodedPath;
     activePlayer.volume = state.volume / 100;
     activePlayer.play();
@@ -4583,7 +4575,7 @@ function startCrossfadeToIndex(index, ms) {
 
     // Yeni parçayı hazırla
     const item = state.playlist[index];
-    const encodedPath = encodeURI('file://' + item.path).replace(/#/g, '%23');
+    const encodedPath = window.aurivo?.path?.toFileUrl?.(item.path) || encodeURI('file://' + item.path).replace(/#/g, '%23');
 
     newPlayer.src = encodedPath;
     newPlayer.volume = 0;

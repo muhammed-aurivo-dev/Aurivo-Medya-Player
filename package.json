@@ -162,7 +162,7 @@
         },
         {
           "from": "third_party/projectm/presets",
-          "to": "third_party/projectm/presets"
+          "to": "visualizer-presets"
         },
         {
           "from": "native-dist",

@@ -1283,6 +1283,9 @@ function isDevMode() {
 }
 
 function getProjectMPresetsPath() {
+    if (app.isPackaged) {
+        return path.join(process.resourcesPath, 'visualizer-presets');
+    }
     return getResourcePath(path.join('third_party', 'projectm', 'presets'));
 }
 
@@ -1334,16 +1337,28 @@ function startVisualizer() {
     const exePath = getVisualizerExecutablePath();
     const presetsPath = getProjectMPresetsPath();
 
-    if (!fs.existsSync(exePath)) {
-        console.error('[Visualizer] executable bulunamadı:', exePath);
-        const title = tMainSync('visualizer.notFoundTitle') || 'Visualizer bulunamadı';
-        let body = tMainSync('visualizer.notFoundBody', { path: exePath }) || `Dosya bulunamadı:\n${exePath}`;
+    const exeOk = fs.existsSync(exePath);
+    const presetsOk = fs.existsSync(presetsPath);
+    if (!exeOk || !presetsOk) {
+        if (!exeOk) console.error('[Visualizer] executable bulunamadı:', exePath);
+        if (!presetsOk) console.error('[Visualizer] presets bulunamadı:', presetsPath);
+
+        const title = tMainSync('visualizer.notFoundTitle') || 'Visualizer dosyaları bulunamadı';
+        let body = tMainSync('visualizer.notFoundBody', { path: exePath }) || '';
+
+        const lines = [];
+        lines.push('Aranan yollar:');
+        lines.push(`- Visualizer: ${exePath}`);
+        lines.push(`- Presets: ${presetsPath}`);
+        lines.push('');
+        lines.push('Çözüm:');
+        lines.push('- Uygulamayı yeniden kurmayı deneyin.');
+        lines.push('- Paketleme sırasında `native-dist` ve presets klasörünün `extraResources` içine dahil olduğundan emin olun.');
         if (process.platform === 'win32') {
-            const expected = process.resourcesPath
-                ? path.join(process.resourcesPath, 'native-dist', 'aurivo-projectm-visualizer.exe')
-                : 'resources\\native-dist\\aurivo-projectm-visualizer.exe';
-            body += `\n\nWindows için Visualizer (.exe) bulunamadı.\nBeklenen konum:\n${expected}\n\nÇözüm:\n- Uygulamayı yeniden kurmayı deneyin.\n- Eğer geliştirme build kullanıyorsanız, Visualizer'ı derleyip bu dizine kopyalayın.\n- Paketleme sırasında \"native-dist\" ve \"third_party/projectm/presets\" extraResources içine dahil olmalı.`;
+            lines.push('- Windows build için presets hedefi: resources/visualizer-presets');
         }
+
+        body = [body, lines.join('\n')].filter(Boolean).join('\n\n');
         dialog.showErrorBox(title, body);
         return false;
     }

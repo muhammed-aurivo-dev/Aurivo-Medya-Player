@@ -55,6 +55,17 @@ function tryLoadNativeAddon() {
         try {
             if (!fs.existsSync(addonPath)) continue;
             prependToWindowsPath(path.dirname(addonPath));
+            if (process.platform === 'win32') {
+                // Bonus: ensure common runtime dirs are also on PATH (BASS dlls etc.)
+                try {
+                    if (process.resourcesPath) {
+                        prependToWindowsPath(path.join(process.resourcesPath, 'native-dist'));
+                        prependToWindowsPath(path.join(process.resourcesPath, 'native', 'build', 'Release'));
+                    }
+                } catch {
+                    // ignore
+                }
+            }
             nativeAudio = require(addonPath);
             isNativeAvailable = true;
             loadedAddonPath = addonPath;

@@ -92,6 +92,55 @@ function ensureWindowsRuntimePaths() {
 }
 
 ensureWindowsRuntimePaths();
+
+let winRuntimeDepsLogged = false;
+function logWindowsRuntimeDepsOnce(context = '') {
+    if (process.platform !== 'win32') return;
+    if (winRuntimeDepsLogged) return;
+    winRuntimeDepsLogged = true;
+
+    try {
+        const base = process.resourcesPath || '(no resourcesPath)';
+        const releaseDir = process.resourcesPath ? path.join(process.resourcesPath, 'native', 'build', 'Release') : '';
+        const nativeDistDir = process.resourcesPath ? path.join(process.resourcesPath, 'native-dist') : '';
+        const binDir = process.resourcesPath ? path.join(process.resourcesPath, 'bin') : '';
+        const visualizerExe = process.resourcesPath ? path.join(nativeDistDir, 'aurivo-projectm-visualizer.exe') : '';
+        const ffmpegExe = process.resourcesPath ? path.join(binDir, 'ffmpeg.exe') : '';
+
+        const requiredBassDlls = [
+            'bass.dll',
+            'bass_fx.dll',
+            'bass_aac.dll',
+            'bassape.dll',
+            'bassflac.dll',
+            'basswv.dll'
+        ];
+
+        const checkDir = (dir) => {
+            if (!dir) return { dir, present: [], missing: requiredBassDlls.slice() };
+            const present = [];
+            const missing = [];
+            for (const f of requiredBassDlls) {
+                const p = path.join(dir, f);
+                if (fs.existsSync(p)) present.push(f);
+                else missing.push(f);
+            }
+            return { dir, present, missing };
+        };
+
+        console.log('[WIN][DEPS]' + (context ? ` (${context})` : ''), 'resourcesPath:', base);
+        console.log('[WIN][DEPS] PATH head:', String(process.env.PATH || '').split(';').slice(0, 6).join(';'));
+        if (visualizerExe) console.log('[WIN][DEPS] visualizer exe:', visualizerExe, 'exists:', fs.existsSync(visualizerExe));
+        if (ffmpegExe) console.log('[WIN][DEPS] ffmpeg exe:', ffmpegExe, 'exists:', fs.existsSync(ffmpegExe));
+
+        const a = checkDir(releaseDir);
+        const b = checkDir(nativeDistDir);
+        console.log('[WIN][DEPS] bass dll check:', a);
+        console.log('[WIN][DEPS] bass dll check:', b);
+    } catch (e) {
+        console.warn('[WIN][DEPS] log failed:', e?.message || e);
+    }
+}
 // ============================================
 // WAYLAND / X11 OTOMATIK ALGILAMA
 // ============================================
@@ -226,6 +275,7 @@ function initNativeAudioEngineSafe({ force = false } = {}) {
     nativeAudioInitAttempted = true;
 
     try {
+        logWindowsRuntimeDepsOnce('native-audio-init');
         audioEngineModule = require('./audioEngine');
         audioEngine = audioEngineModule?.audioEngine || null;
 
@@ -239,6 +289,9 @@ function initNativeAudioEngineSafe({ force = false } = {}) {
 
         if (isNativeAudioAvailable) {
             console.log('✓ C++ Aurivo Audio Engine aktif');
+            if (process.platform === 'win32') {
+                console.log('[NativeAudio] addon:', audioEngineModule?.loadedAddonPath || '(unknown)');
+            }
         } else {
             console.warn('⚠ Native audio başlatılamadı, HTML5 Audio kullanılacak');
             const err = audioEngineModule?.lastNativeLoadError;
@@ -1395,7 +1448,9 @@ function startVisualizer() {
         if (!exeOk) console.error('[Visualizer] executable bulunamadı:', exePath);
         if (!presetsOk) console.error('[Visualizer] presets bulunamadı:', presetsPath);
 
-        const title = tMainSync('visualizer.notFoundTitle') || 'Görselleştirici bileşenleri eksik';
+        const title = tMainSync('visualizer.notFoundTitle') || (process.platform === 'win32'
+            ? 'Görselleştirici Windows uyumlu değil'
+            : 'Görselleştirici bileşenleri eksik');
         let body = tMainSync('visualizer.notFoundBody', { path: exePath }) || '';
 
         const lines = [];
@@ -1410,7 +1465,9 @@ function startVisualizer() {
         for (const p of presetsCandidates) lines.push(`  - ${p}`);
         lines.push('');
         lines.push('Çözüm:');
-        lines.push('- Visualizer, Windows üzerinde çalışmak için bir `.exe` gerektirir.');
+        if (process.platform === 'win32') {
+            lines.push('- Görselleştirici, Windows üzerinde çalışmak için `aurivo-projectm-visualizer.exe` gerektirir.');
+        }
         lines.push('- Uygulamayı yeniden kurmayı deneyin.');
         lines.push('- Paketleme sırasında `native-dist` (exe) ve presets klasörünün `extraResources` içine dahil olduğundan emin olun.');
         lines.push('- Bu eksiklik müzik kütüphanesini/oynatıcıyı etkilemez; sadece görselleştirici devre dışı kalır.');

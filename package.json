@@ -88,18 +88,6 @@
       "native/build/Release/*.dll",
       "native/build/Release/*.dylib"
     ],
-    "extraResources": [
-      {
-        "from": "native/build/Release",
-        "to": "native/build/Release",
-        "filter": [
-          "*.node",
-          "*.so",
-          "*.dll",
-          "*.dylib"
-        ]
-      }
-    ],
     "linux": {
       "target": [
         "AppImage"
@@ -112,6 +100,14 @@
         {
           "from": "/usr/bin/ffmpeg",
           "to": "bin/ffmpeg"
+        },
+        {
+          "from": "native/build/Release",
+          "to": "native/build/Release",
+          "filter": [
+            "**/*.node",
+            "**/*.so"
+          ]
         }
       ],
       "extraFiles": [
@@ -164,6 +160,14 @@
           ]
         },
         {
+          "from": "native/build/Release",
+          "to": "native/build/Release",
+          "filter": [
+            "**/*.node",
+            "**/*.dll"
+          ]
+        },
+        {
           "from": "icons/aurivo.ico",
           "to": "icons/aurivo.ico"
         },
@@ -189,6 +193,13 @@
         {
           "from": "libs/windows",
           "to": "native/build/Release",
+          "filter": [
+            "*.dll"
+          ]
+        },
+        {
+          "from": "libs/windows",
+          "to": "native-dist",
           "filter": [
             "*.dll"
           ]

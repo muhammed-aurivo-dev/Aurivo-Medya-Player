@@ -57,6 +57,8 @@ AppImage'i terminalden çalıştırıp visualizer açtığınızda şu logları 
 npm run build:win
 ```
 
+> Not: `build:win` komutu artık Windows native dosyalarını doğrular. Linux'ta yanlışlıkla Windows installer üretip (ELF) dağıtmayı engellemek için build öncesi `scripts/verify-win-artifacts.js` çalışır.
+
 Çıktı:
 - `dist/Aurivo-1.0.0-win-x64.exe` (NSIS installer)
 - `dist/Aurivo-1.0.0-win-x64.zip` (portable)
@@ -88,6 +90,8 @@ ls -la dist/linux-unpacked/resources/native-dist/aurivo-projectm-visualizer
 ```bash
 # Native modülleri yeniden derle
 npm run rebuild-native
+#
+# Not: Bu komut `native/` içinde otomatik `npm ci` çalıştırır (node-addon-api vb. için).
 
 # Visualizer'ı yeniden derle
 rm -rf build-visualizer

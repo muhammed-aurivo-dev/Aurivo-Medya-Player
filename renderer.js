@@ -71,6 +71,25 @@ const AUDIO_EXTENSIONS = [
 // Video formatları (ileride kullanılabilir)
 const VIDEO_EXTENSIONS = ['mp4', 'mkv', 'webm', 'avi', 'mov', 'wmv', 'm4v', 'flv', 'mpg', 'mpeg'];
 
+function toLocalFileUrl(p) {
+    try {
+        const viaBridge = window.aurivo?.path?.toFileUrl?.(p);
+        if (viaBridge) return viaBridge;
+    } catch {
+        // ignore
+    }
+
+    const raw = String(p || '').trim();
+    if (!raw) return '';
+
+    // Best-effort fallback for cases where preload bridge is missing.
+    // Windows path: C:\foo\bar.mp4 -> file:///C:/foo/bar.mp4
+    const normalized = raw.replace(/\\/g, '/');
+    const needsLeadingSlash = /^[a-zA-Z]:\//.test(normalized);
+    const urlPath = needsLeadingSlash ? `/${normalized}` : normalized;
+    return encodeURI(`file://${urlPath}`).replace(/#/g, '%23');
+}
+
 // DOM Elements
 const elements = {};
 
@@ -3788,7 +3807,7 @@ function playVideo(videoPath) {
     switchPage('video');
 
     // Video player'ı ayarla ve oynat
-    elements.videoPlayer.src = window.aurivo?.path?.toFileUrl?.(videoPath) || ('file://' + videoPath);
+    elements.videoPlayer.src = toLocalFileUrl(videoPath);
 
     // Video ses seviyesini ayarla (kaydedilen seviye)
     elements.videoPlayer.volume = state.volume / 100;
@@ -3953,7 +3972,7 @@ async function playIndex(index) {
 // HTML5 Audio ile oynat (fallback)
 function playWithHTML5Audio(item) {
     const activePlayer = getActiveAudioPlayer();
-    const encodedPath = window.aurivo?.path?.toFileUrl?.(item.path) || encodeURI('file://' + item.path).replace(/#/g, '%23');
+    const encodedPath = toLocalFileUrl(item.path);
     activePlayer.src = encodedPath;
     activePlayer.volume = state.volume / 100;
     activePlayer.play();
@@ -4575,7 +4594,7 @@ function startCrossfadeToIndex(index, ms) {
 
     // Yeni parçayı hazırla
     const item = state.playlist[index];
-    const encodedPath = window.aurivo?.path?.toFileUrl?.(item.path) || encodeURI('file://' + item.path).replace(/#/g, '%23');
+    const encodedPath = toLocalFileUrl(item.path);
 
     newPlayer.src = encodedPath;
     newPlayer.volume = 0;

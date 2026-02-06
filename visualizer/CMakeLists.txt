@@ -26,6 +26,9 @@ endif()
 find_package(OpenGL REQUIRED)
 include_directories(${OPENGL_INCLUDE_DIR})
 
+# Threads (portable replacement for hardcoded pthread)
+find_package(Threads REQUIRED)
+
 # Use system libprojectm instead of bundled Clementine version
 pkg_check_modules(PROJECTM REQUIRED projectM-4)
 pkg_check_modules(PROJECTM_PLAYLIST REQUIRED projectM-4-playlist)
@@ -78,7 +81,7 @@ target_link_libraries(aurivo-projectm-visualizer
     imgui
     projectM-4
     projectM-4-playlist
-    pthread
+    Threads::Threads
 )
 
 if(SDL2_IMAGE_FOUND)

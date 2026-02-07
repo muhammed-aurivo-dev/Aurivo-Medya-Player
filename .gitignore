@@ -14,6 +14,8 @@ dist/
 native/build/
 build-visualizer/
 visualizer/build/
+native-dist/*
+!native-dist/.gitkeep
 
 # Python
 venv/
@@ -24,3 +26,7 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+imgui.ini
+.vscode/
+native/*.ipynb
+native/build_log.txt

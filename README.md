@@ -39,3 +39,7 @@ pip install -r requirements.txt
 npm run dev
 ```
 
+## Notlar (Repo sadeleştirme / stabil build)
+
+- `native-dist/` klasörü **build çıktısıdır** (Visualizer exe + runtime DLL/SO). Git’te tutulmaz; build öncesi yerel olarak üretilmelidir.
+- Native bileşenler için detaylar: `BUILD-TEST.md` (Linux) ve `WINDOWS-BUILD.md` (Windows).

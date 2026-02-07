@@ -13,7 +13,7 @@
 npm run build:linux
 ```
 
-Çıktı: `dist/Aurivo-1.0.0-linux-x64.AppImage`
+Çıktı (örnek): `dist/Aurivo-*-linux-x64.AppImage`
 
 ### 2. Kurulum & Test
 ```bash
@@ -25,6 +25,7 @@ chmod +x dist/Aurivo-*.AppImage
 ```
 
 ### 3. Visualizer Testi
+> Not: `npm run build:linux` öncesi `native-dist/aurivo-projectm-visualizer` dosyası mevcut olmalıdır (visualizer CMake build çıktısı).
 
 **A) İkon Kontrolü:**
 1. Uygulamayı aç

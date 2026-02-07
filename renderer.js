@@ -59,7 +59,8 @@ const state = {
     webPosition: 0,
     webTitle: '',
     webArtist: '',
-    webAlbum: ''
+    webAlbum: '',
+    specialPaths: null
 };
 
 // Desteklenen ses formatları (kütüphane tarama filtresi)
@@ -125,12 +126,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     // C++ Audio Engine kontrolü
     await checkNativeAudio();
 
+    try {
+        state.specialPaths = await window.aurivo?.getSpecialPaths?.();
+        console.log('[PATHS] special paths:', state.specialPaths);
+    } catch (e) {
+        console.warn('[PATHS] getSpecialPaths failed:', e?.message || e);
+        state.specialPaths = null;
+    }
+
     await loadSettings();
     await loadPlaylist();
     setupEventListeners();
     setupVisualizer();
     await initializeFileTree();
     initializeRainbowSliders();
+
+    try {
+        if (elements.libraryActionsAudio) elements.libraryActionsAudio.classList.toggle('hidden', state.mediaFilter !== 'audio');
+        if (elements.libraryActionsVideo) elements.libraryActionsVideo.classList.toggle('hidden', state.mediaFilter !== 'video');
+    } catch {
+        // ignore
+    }
 
     console.log('Aurivo Player başlatıldı');
     if (useNativeAudio) {
@@ -303,6 +319,8 @@ function cacheElements() {
 
     // File Tree
     elements.fileTree = document.getElementById('fileTree');
+    elements.libraryActionsAudio = document.getElementById('libraryActionsAudio');
+    elements.libraryActionsVideo = document.getElementById('libraryActionsVideo');
 
     // Cover
     elements.coverArt = document.getElementById('coverArt');
@@ -329,6 +347,10 @@ function cacheElements() {
 
     // Playlist
     elements.playlist = document.getElementById('playlist');
+    elements.musicAddFolderBtn = document.getElementById('musicAddFolderBtn');
+    elements.musicAddFilesBtn = document.getElementById('musicAddFilesBtn');
+    elements.videoAddFolderBtn = document.getElementById('videoAddFolderBtn');
+    elements.videoAddFilesBtn = document.getElementById('videoAddFilesBtn');
 
     // Video & Web
     elements.videoPlayer = document.getElementById('videoPlayer');
@@ -672,6 +694,88 @@ function setupEventListeners() {
 
     // Download settings (Preferences modal)
     setupDownloadPreferencesEvents();
+
+    // Music/Video toolbar buttons (kullanıcı hızlı ekleme)
+    if (elements.musicAddFolderBtn) {
+        elements.musicAddFolderBtn.addEventListener('click', async () => {
+            try {
+                state.mediaFilter = 'audio';
+                const res = await window.aurivo?.dialog?.openFolder?.({
+                    title: 'Müzik klasörü seç',
+                    defaultPath: state.specialPaths?.music || undefined
+                });
+                if (res?.path) addUserFolder(res.path, res.name || window.aurivo?.path?.basename?.(res.path) || 'Klasör');
+            } catch (e) {
+                safeNotify('Klasör seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.musicAddFilesBtn) {
+        elements.musicAddFilesBtn.addEventListener('click', async () => {
+            try {
+                state.mediaFilter = 'audio';
+                const files = await window.aurivo?.dialog?.openFiles?.({
+                    title: 'Müzik dosyalarını seç',
+                    filters: [
+                        { name: 'Müzik Dosyaları', extensions: AUDIO_EXTENSIONS },
+                        { name: 'Tüm Dosyalar', extensions: ['*'] }
+                    ]
+                });
+                if (!files || !files.length) return;
+
+                let firstIndex = null;
+                let addedCount = 0;
+                for (const f of files) {
+                    const { index, added } = addToPlaylist(f.path, f.name);
+                    if (added) addedCount++;
+                    if (firstIndex === null && typeof index === 'number' && index >= 0) firstIndex = index;
+                }
+                if (addedCount) safeNotify(`${addedCount} dosya eklendi`, 'success');
+                if (state.currentIndex === -1 && typeof firstIndex === 'number' && firstIndex >= 0) {
+                    playIndex(firstIndex);
+                }
+            } catch (e) {
+                safeNotify('Dosya seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.videoAddFolderBtn) {
+        elements.videoAddFolderBtn.addEventListener('click', async () => {
+            try {
+                state.mediaFilter = 'video';
+                const res = await window.aurivo?.dialog?.openFolder?.({
+                    title: 'Video klasörü seç',
+                    defaultPath: state.specialPaths?.videos || undefined
+                });
+                if (res?.path) addUserFolder(res.path, res.name || window.aurivo?.path?.basename?.(res.path) || 'Klasör');
+            } catch (e) {
+                safeNotify('Klasör seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
+
+    if (elements.videoAddFilesBtn) {
+        elements.videoAddFilesBtn.addEventListener('click', async () => {
+            try {
+                state.mediaFilter = 'video';
+                const files = await window.aurivo?.dialog?.openFiles?.({
+                    title: 'Video dosyalarını seç',
+                    filters: [
+                        { name: 'Video Dosyaları', extensions: VIDEO_EXTENSIONS },
+                        { name: 'Tüm Dosyalar', extensions: ['*'] }
+                    ]
+                });
+                if (!files || !files.length) return;
+
+                state.videoFiles = files.map((f) => ({ name: f.name, path: f.path }));
+                playVideo(state.videoFiles[0].path);
+            } catch (e) {
+                safeNotify('Video seçilemedi: ' + (e?.message || e), 'error');
+            }
+        });
+    }
 
     // Visualizer (projectM)
     const visualizerBtn = document.getElementById('visualizer-btn');
@@ -1082,15 +1186,33 @@ function setupSystemTrayControl() {
                 togglePlayPause();
                 break;
             case 'stop':
-                stopAudio();
+                if (state.activeMedia === 'video') {
+                    stopVideo();
+                } else if (state.activeMedia === 'web') {
+                    stopWeb();
+                } else {
+                    stopAudio();
+                }
                 state.isPlaying = false;
                 updatePlayPauseIcon(false);
                 break;
             case 'previous':
-                playPreviousWithCrossfade();
+                if (state.activeMedia === 'video') {
+                    if (state.videoFiles.length > 1 && state.currentVideoIndex > 0) {
+                        playPreviousVideo();
+                    }
+                } else if (state.activeMedia === 'audio') {
+                    playPreviousWithCrossfade();
+                }
                 break;
             case 'next':
-                playNextWithCrossfade();
+                if (state.activeMedia === 'video') {
+                    if (state.videoFiles.length > 1 && state.currentVideoIndex >= 0 && state.currentVideoIndex < state.videoFiles.length - 1) {
+                        playNextVideo();
+                    }
+                } else if (state.activeMedia === 'audio') {
+                    playNextWithCrossfade();
+                }
                 break;
             case 'mute-toggle':
                 toggleMute();
@@ -1186,6 +1308,18 @@ function setupSystemTrayControl() {
                 } catch (e) {
                     console.error('SetPosition error:', e);
                 }
+            } else if (state.activeMedia === 'video' && elements.videoPlayer) {
+                try {
+                    const video = elements.videoPlayer;
+                    const d = Number(video.duration || 0);
+                    const pos = Math.max(0, Number(positionSeconds) || 0);
+                    const next = d > 0 ? Math.min(d, pos) : pos;
+                    video.currentTime = next;
+                    updateTimeDisplay();
+                    updateMPRISMetadata();
+                } catch (e) {
+                    console.warn('Video position error:', e);
+                }
             } else {
                 const activePlayer = getActiveAudioPlayer();
                 if (activePlayer) activePlayer.currentTime = positionSeconds;
@@ -1200,8 +1334,17 @@ function setupSystemTrayControl() {
 function updateTrayState() {
     if (!window.aurivo || !window.aurivo.updateTrayState) return;
 
-    const currentTrack = state.playlist[state.currentIndex];
-    const trackName = currentTrack ? (currentTrack.title || currentTrack.name || 'Bilinmeyen Parça') : 'Parça Yok';
+    let trackName = 'Parça Yok';
+    if (state.activeMedia === 'video') {
+        trackName = state.currentVideoPath
+            ? (window.aurivo?.path?.basename?.(state.currentVideoPath) || String(state.currentVideoPath).split('/').pop() || 'Video')
+            : 'Video';
+    } else if (state.activeMedia === 'web') {
+        trackName = state.webTitle || elements.nowPlayingLabel?.textContent?.replace('Şu An Çalınan: ', '') || 'Web';
+    } else {
+        const currentTrack = state.playlist[state.currentIndex];
+        trackName = currentTrack ? (currentTrack.title || currentTrack.name || 'Bilinmeyen Parça') : 'Parça Yok';
+    }
 
     window.aurivo.updateTrayState({
         isPlaying: state.isPlaying,
@@ -1242,6 +1385,9 @@ async function updateMPRISMetadata() {
     let artist = 'Bilinmeyen Sanatçı';
     let album = '';
     let trackId = state.currentIndex;
+    let canGoNext = true;
+    let canGoPrevious = true;
+    let canSeek = true;
 
     if (state.activeMedia === 'video') {
         // Video için metadata
@@ -1251,9 +1397,13 @@ async function updateMPRISMetadata() {
             position = video.currentTime || 0; // saniye
 
             // Video dosya adından başlık çıkar
-            const fileName = video.src.split('/').pop().split('#')[0].split('?')[0];
-            title = decodeURIComponent(fileName).replace(/\.[^/.]+$/, '');
+            const fileName = window.aurivo?.path?.basename?.(state.currentVideoPath || '') || video.src.split('/').pop().split('#')[0].split('?')[0];
+            title = decodeURIComponent(String(fileName || '')).replace(/\.[^/.]+$/, '') || 'Video';
             artist = 'Video';
+            // FIX: DBus objectPath için '-' gibi karakterler sorun çıkarabilir; güvenli trackId üret.
+            trackId = `video_${Math.max(0, Number(state.currentVideoIndex) || 0)}`;
+            canGoNext = state.videoFiles.length > 1 && state.currentVideoIndex < state.videoFiles.length - 1;
+            canGoPrevious = state.videoFiles.length > 1 && state.currentVideoIndex > 0;
         }
     } else if (state.activeMedia === 'audio') {
         // Audio için metadata
@@ -1288,6 +1438,8 @@ async function updateMPRISMetadata() {
             duration = activePlayer.duration || 0; // saniye
             position = activePlayer.currentTime || 0; // saniye
         }
+        canGoNext = state.playlist.length > 0 && state.currentIndex < state.playlist.length - 1;
+        canGoPrevious = state.playlist.length > 0 && state.currentIndex > 0;
     } else if (state.activeMedia === 'web') {
         title = state.webTitle || elements.nowPlayingLabel.textContent.replace('Şu An Çalınan: ', '') || 'Web Medya';
         artist = state.webArtist || 'Aurivo Web';
@@ -1295,6 +1447,9 @@ async function updateMPRISMetadata() {
         trackId = `web_${state.webTrackId}`; // FIX: Hyphen replaced with underscore for safer DBus path
         duration = state.webDuration || 0;
         position = state.webPosition || 0;
+        canGoNext = false;
+        canGoPrevious = false;
+        canSeek = true;
     }
 
     window.aurivo.updateMPRISMetadata({
@@ -1305,7 +1460,10 @@ async function updateMPRISMetadata() {
         albumArt: state.currentCover || '',
         duration: duration,
         position: position,
-        isPlaying: state.isPlaying
+        isPlaying: state.isPlaying,
+        canGoNext,
+        canGoPrevious,
+        canSeek
     });
 }
 
@@ -2769,6 +2927,14 @@ function handleSidebarClick(btn) {
         state.mediaFilter = 'all';
     }
 
+    // Library action buttons (KÜTÜPHANE altı) sekmeye göre
+    try {
+        if (elements.libraryActionsAudio) elements.libraryActionsAudio.classList.toggle('hidden', state.mediaFilter !== 'audio');
+        if (elements.libraryActionsVideo) elements.libraryActionsVideo.classList.toggle('hidden', state.mediaFilter !== 'video');
+    } catch {
+        // ignore
+    }
+
     // *** SEKMELERİ İZOLE ET - DİĞER MEDYALARI KAPAT ***
     isolateMediaSection(page);
 
@@ -2790,7 +2956,7 @@ function handleSidebarClick(btn) {
     if (page === 'music' || page === 'files') {
         // Müzik sekmesine geçildiğinde
         const home = window.aurivo.getHomeDir();
-        const defaultMusicPath = window.aurivo.path.join(home, 'Müzik');
+        const defaultMusicPath = state.specialPaths?.music || window.aurivo.path.join(home, 'Music');
 
         if (state.lastAudioPath) {
             // Önceki müzik konumuna git
@@ -2802,11 +2968,20 @@ function handleSidebarClick(btn) {
     } else if (page === 'video') {
         // Video sekmesine geçildiğinde
         const home = window.aurivo.getHomeDir();
-        const defaultVideoPath = state.lastVideoPath || window.aurivo.path.join(home, 'Videolar');
+        const defaultVideoPath = state.lastVideoPath || state.specialPaths?.videos || window.aurivo.path.join(home, 'Videos');
         loadDirectory(defaultVideoPath, false);
     } else if (state.currentPath) {
         // Diğer sekmeler için normal yükleme
         loadDirectory(state.currentPath, false);
+    }
+
+    // File tree'de pinned folder listesini sekmeye göre güncelle
+    try {
+        if (panel === 'library') {
+            initializeFileTree();
+        }
+    } catch {
+        // ignore
     }
 }
 
@@ -3041,39 +3216,27 @@ async function initializeFileTree() {
         return;
     }
 
-    // Home dizinini belirle
-    const home = window.aurivo.getHomeDir();
+    const home = state.specialPaths?.home || window.aurivo.getHomeDir();
 
-    // Başlangıç path'ini ayarla (history için önemli!)
-    state.currentPath = home;
-    state.pathHistory = [];
-    state.pathForward = [];
+    // Kullanıcının eklediği klasörleri yükle (sekme bazlı)
+    const scope = getUserFoldersScope();
+    const savedFolders = loadSavedFolders(scope);
 
-    // Kullanıcının eklediği klasörleri yükle
-    const savedFolders = loadSavedFolders();
+    const defaultMusicPath = state.specialPaths?.music || window.aurivo.path.join(home, 'Music');
+    const defaultVideosPath = state.specialPaths?.videos || window.aurivo.path.join(home, 'Videos');
+    const defaultDownloadsPath = state.specialPaths?.downloads || window.aurivo.path.join(home, 'Downloads');
 
-    // Varsayılan klasörler (Videolar kaldırıldı)
-    const defaultFolders = [
-        { name: 'Müzik', path: window.aurivo.path.join(home, 'Müzik'), icon: '🎵' },
-        { name: 'İndirilenler', path: window.aurivo.path.join(home, 'İndirilenler'), icon: '📥' }
-    ];
+    const defaultFolders = (scope === 'video')
+        ? [
+            { name: 'Videolar', path: defaultVideosPath, icon: '🎬' },
+            { name: 'İndirilenler', path: defaultDownloadsPath, icon: '📥' }
+        ]
+        : [
+            { name: 'Müzik', path: defaultMusicPath, icon: '🎵' },
+            { name: 'İndirilenler', path: defaultDownloadsPath, icon: '📥' }
+        ];
 
     elements.fileTree.innerHTML = '';
-
-    // "Dosya/Klasör Ekle" butonu
-    const addFolderBtn = document.createElement('div');
-    addFolderBtn.className = 'tree-item add-folder-btn';
-    addFolderBtn.innerHTML = `
-        <span class="tree-icon">➕</span>
-        <span class="tree-name">Klasör Ekle</span>
-    `;
-    addFolderBtn.addEventListener('click', openFolderDialog);
-    elements.fileTree.appendChild(addFolderBtn);
-
-    // Ayırıcı çizgi
-    const separator = document.createElement('div');
-    separator.className = 'tree-separator';
-    elements.fileTree.appendChild(separator);
 
     // Kullanıcının eklediği klasörler (varsa)
     savedFolders.forEach(folder => {
@@ -3081,6 +3244,7 @@ async function initializeFileTree() {
         // Sağ tık menüsü için işaretle
         item.classList.add('user-folder');
         item.dataset.userFolder = 'true';
+        item.dataset.folderScope = scope;
         elements.fileTree.appendChild(item);
     });
 
@@ -3093,10 +3257,20 @@ async function initializeFileTree() {
     console.log('File Tree yüklendi -', defaultFolders.length + savedFolders.length, 'klasör');
 }
 
-// Kaydedilmiş klasörleri yükle
-function loadSavedFolders() {
+function getUserFoldersScope() {
+    // 'files' ve 'music' sekmeleri audio olarak kabul edilir.
+    return state.mediaFilter === 'video' ? 'video' : 'audio';
+}
+
+function getUserFoldersStorageKey(scope) {
+    const s = scope === 'video' ? 'video' : 'audio';
+    return `aurivo_user_folders_${s}`;
+}
+
+function loadSavedFolders(scope) {
     try {
-        const saved = localStorage.getItem('aurivo_user_folders');
+        const key = getUserFoldersStorageKey(scope);
+        const saved = localStorage.getItem(key);
         return saved ? JSON.parse(saved) : [];
     } catch (e) {
         console.error('Klasörler yüklenemedi:', e);
@@ -3104,10 +3278,10 @@ function loadSavedFolders() {
     }
 }
 
-// Klasörleri kaydet
-function saveFolders(folders) {
+function saveFolders(scope, folders) {
     try {
-        localStorage.setItem('aurivo_user_folders', JSON.stringify(folders));
+        const key = getUserFoldersStorageKey(scope);
+        localStorage.setItem(key, JSON.stringify(folders));
     } catch (e) {
         console.error('Klasörler kaydedilemedi:', e);
     }
@@ -3116,7 +3290,12 @@ function saveFolders(folders) {
 // Klasör ekleme dialog'u
 async function openFolderDialog() {
     try {
-        const result = await window.aurivo.dialog.openFolder();
+        const scope = getUserFoldersScope();
+        const defaultPath = scope === 'video' ? state.specialPaths?.videos : state.specialPaths?.music;
+        const result = await window.aurivo.dialog.openFolder({
+            title: scope === 'video' ? 'Video klasörü seç' : 'Müzik klasörü seç',
+            defaultPath: defaultPath || undefined
+        });
         if (result && result.path) {
             addUserFolder(result.path, result.name);
         }
@@ -3127,7 +3306,8 @@ async function openFolderDialog() {
 
 // Kullanıcı klasörü ekle
 function addUserFolder(path, name) {
-    const folders = loadSavedFolders();
+    const scope = getUserFoldersScope();
+    const folders = loadSavedFolders(scope);
 
     // Zaten ekli mi kontrol et
     if (folders.some(f => f.path === path)) {
@@ -3136,7 +3316,7 @@ function addUserFolder(path, name) {
     }
 
     folders.push({ name, path });
-    saveFolders(folders);
+    saveFolders(scope, folders);
 
     // File tree'yi yeniden yükle
     initializeFileTree();
@@ -3145,7 +3325,7 @@ function addUserFolder(path, name) {
 
     // Kullanıcı klasör seçtiğinde hemen aç (dosyalar görünmez sanılmasın)
     try {
-        state.mediaFilter = 'audio';
+        // Sekmeye göre filtreyi bozma (video sekmesinde video, müzikte audio kalsın)
         Promise.resolve(loadDirectory(path)).catch((e) => console.error('Klasör otomatik açılamadı:', e));
     } catch (e) {
         console.error('Klasör otomatik açma hatası:', e);
@@ -3154,9 +3334,10 @@ function addUserFolder(path, name) {
 
 // Kullanıcı klasörünü kaldır
 function removeUserFolder(path) {
-    let folders = loadSavedFolders();
+    const scope = getUserFoldersScope();
+    let folders = loadSavedFolders(scope);
     folders = folders.filter(f => f.path !== path);
-    saveFolders(folders);
+    saveFolders(scope, folders);
 
     // File tree'yi yeniden yükle
     initializeFileTree();
@@ -3223,11 +3404,12 @@ function handleFileTreeContextMenu(e) {
 
     const path = item.dataset.path;
     const name = item.dataset.name;
+    const scope = item.dataset.folderScope || getUserFoldersScope();
 
-    showFolderContextMenu(e.clientX, e.clientY, path, name);
+    showFolderContextMenu(e.clientX, e.clientY, path, name, scope);
 }
 
-function showFolderContextMenu(x, y, path, name) {
+function showFolderContextMenu(x, y, path, name, scope) {
     // Varolan menüyü kaldır
     let menu = document.getElementById('folderContextMenu');
     if (menu) menu.remove();
@@ -3255,7 +3437,7 @@ function showFolderContextMenu(x, y, path, name) {
 
     // Menü öğelerine tıklama
     menu.querySelector('[data-action="remove"]').addEventListener('click', () => {
-        removeUserFolder(path);
+        removeUserFolderWithScope(path, scope);
         menu.remove();
     });
 
@@ -3263,6 +3445,14 @@ function showFolderContextMenu(x, y, path, name) {
         loadDirectory(path);
         menu.remove();
     });
+}
+
+function removeUserFolderWithScope(path, scope) {
+    const s = scope === 'video' ? 'video' : 'audio';
+    let folders = loadSavedFolders(s);
+    folders = folders.filter(f => f.path !== path);
+    saveFolders(s, folders);
+    initializeFileTree();
 }
 
 function createTreeItem(name, path, isDirectory, icon = null) {
@@ -3792,11 +3982,12 @@ function playVideo(videoPath) {
     stopAudio();
     stopWeb();
 
-    // Videolar listesinde bu videonun indeksini bul
-    const videoIndex = state.videoFiles.findIndex(v => v.path === videoPath);
+    // Videolar listesinde bu videonun indeksini bul (tek dosya açma senaryosu için fallback)
+    let videoIndex = state.videoFiles.findIndex(v => v.path === videoPath);
     if (videoIndex === -1) {
-        console.error('Video listede bulunamadı:', videoPath);
-        return;
+        const fileName = window.aurivo?.path?.basename?.(videoPath) || String(videoPath || '').split('/').pop() || 'video';
+        state.videoFiles = [{ name: fileName, path: videoPath }];
+        videoIndex = 0;
     }
 
     state.currentVideoIndex = videoIndex;
@@ -3824,8 +4015,8 @@ function playVideo(videoPath) {
 
     elements.videoPlayer.play();
 
-    // Video ikonu göster
-    updateCoverArt(null, 'video');
+    // Video kapağı (thumbnail) göster
+    extractVideoCover(videoPath);
 
     state.isPlaying = true;
     updatePlayPauseIcon(true);
@@ -4317,6 +4508,21 @@ async function extractAlbumArt(filePath) {
 
     console.log('Varsayılan kapak kullanılacak');
     updateCoverArt(null, 'audio');
+}
+
+async function extractVideoCover(filePath) {
+    try {
+        if (window.aurivo?.getVideoThumbnail) {
+            const thumb = await window.aurivo.getVideoThumbnail(filePath);
+            if (thumb) {
+                updateCoverArt(thumb, 'video');
+                return;
+            }
+        }
+    } catch {
+        // ignore
+    }
+    updateCoverArt(null, 'video');
 }
 
 // Kapak resmini güncelle

@@ -981,8 +981,10 @@ function updateMPRISMetadata(metadata) {
         }
 
         // Seek yeteneklerini güncelle
-        mprisPlayer.canSeek = true;
+        mprisPlayer.canSeek = (typeof metadata.canSeek === 'boolean') ? metadata.canSeek : true;
         mprisPlayer.canControl = true;
+        if (typeof metadata.canGoNext === 'boolean') mprisPlayer.canGoNext = metadata.canGoNext;
+        if (typeof metadata.canGoPrevious === 'boolean') mprisPlayer.canGoPrevious = metadata.canGoPrevious;
 
         console.log('MPRIS metadata güncellendi:', metadata.title, 'duration:', metadata.duration.toFixed(1), 's, position:', metadata.position.toFixed(1), 's');
     } catch (e) {
@@ -1745,11 +1747,24 @@ ipcMain.handle('dialog:openFolder', async (_event, opts) => {
     };
 });
 
-// Müzik dosyaları seçme dialog'u
-ipcMain.handle('dialog:openFiles', async (event, filters) => {
+// Dosyaları seçme dialog'u (müzik/video gibi farklı filtreler için kullanılabilir)
+// Geriye uyumluluk:
+// - openFiles(filtersArray)
+// - openFiles({ title, filters })
+ipcMain.handle('dialog:openFiles', async (event, filtersOrOpts) => {
+    const opts = (filtersOrOpts && typeof filtersOrOpts === 'object' && !Array.isArray(filtersOrOpts))
+        ? filtersOrOpts
+        : { filters: filtersOrOpts };
+
+    const title = (opts && typeof opts.title === 'string' && opts.title.trim())
+        ? opts.title.trim()
+        : tMainSync('dialog.selectMusicFiles');
+
+    const filters = opts?.filters;
+
     const result = await dialog.showOpenDialog(mainWindow, {
         properties: ['openFile', 'multiSelections'],
-        title: tMainSync('dialog.selectMusicFiles'),
+        title,
         filters: filters || [
             { name: tMainSync('dialog.filters.musicFiles'), extensions: ['mp3', 'flac', 'wav', 'ogg', 'm4a', 'aac', 'wma', 'opus', 'ape', 'wv'] },
             { name: tMainSync('dialog.filters.allFiles'), extensions: ['*'] }
@@ -1975,8 +1990,8 @@ ipcMain.handle('fs:readDirectory', async (event, dirPath) => {
         // Windows testleri için: kütüphane/kırpma filtreleri bu uzantılara göre çalışıyor.
         // Not: Bu liste "noktasız" (mp3) tutulur, kontrol `toLowerCase()` ile yapılır.
         const SUPPORTED_MEDIA_EXTENSIONS = new Set([
-            'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff', 'opus',
-            'mp4', 'mkv', 'avi'
+            'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'aiff', 'opus', 'ape', 'wv',
+            'mp4', 'mkv', 'webm', 'avi', 'mov', 'wmv', 'm4v', 'flv', 'mpg', 'mpeg'
         ]);
 
         const items = await fs.promises.readdir(dirPath, { withFileTypes: true });
@@ -2222,6 +2237,36 @@ ipcMain.handle('media:getAlbumArt', async (event, filePath) => {
     }
 });
 
+// Video thumbnail çıkarma (ffmpeg ile 1 kare al)
+ipcMain.handle('media:getVideoThumbnail', async (_event, filePath) => {
+    try {
+        const fp = String(filePath || '').trim();
+        if (!fp) return null;
+        try {
+            await fs.promises.access(fp);
+        } catch {
+            return null;
+        }
+        return await extractVideoThumbnailWithFFmpeg(fp);
+    } catch (e) {
+        console.log('Video thumbnail çıkarılamadı:', e?.message || e);
+        return null;
+    }
+});
+
+function getFfmpegPathForEnv() {
+    // Production'da bundled ffmpeg'i kullan, development'da system ffmpeg
+    let ffmpegPath = 'ffmpeg';
+    if (app.isPackaged) {
+        if (process.platform === 'win32') {
+            ffmpegPath = path.join(process.resourcesPath, 'bin', 'ffmpeg.exe');
+        } else {
+            ffmpegPath = path.join(process.resourcesPath, 'bin', 'ffmpeg');
+        }
+    }
+    return ffmpegPath;
+}
+
 // Album art çıkarma - ID3v2 veya ffmpeg kullan
 async function extractEmbeddedCover(filePath) {
     try {
@@ -2246,17 +2291,7 @@ async function extractCoverWithFFmpeg(filePath) {
     return new Promise((resolve) => {
         const { spawn } = require('child_process');
 
-        // Production'da bundled ffmpeg'i kullan, development'da system ffmpeg
-        let ffmpegPath = 'ffmpeg';
-        if (app.isPackaged) {
-            // Platform-specific ffmpeg binary path
-            if (process.platform === 'win32') {
-                ffmpegPath = path.join(process.resourcesPath, 'bin', 'ffmpeg.exe');
-            } else {
-                // Linux/Mac
-                ffmpegPath = path.join(process.resourcesPath, 'bin', 'ffmpeg');
-            }
-        }
+        const ffmpegPath = getFfmpegPathForEnv();
 
         // Windows'ta ffmpeg yoksa fallback
         if (process.platform === 'win32' && app.isPackaged) {
@@ -2314,6 +2349,59 @@ async function extractCoverWithFFmpeg(filePath) {
             console.log('ffmpeg error:', err.message);
             resolve(null);
         });
+    });
+}
+
+// ffmpeg ile videodan thumbnail al (JPEG)
+async function extractVideoThumbnailWithFFmpeg(filePath) {
+    return new Promise((resolve) => {
+        const { spawn } = require('child_process');
+
+        const ffmpegPath = getFfmpegPathForEnv();
+
+        if (app.isPackaged && process.platform === 'win32' && !fs.existsSync(ffmpegPath)) {
+            resolve(null);
+            return;
+        }
+
+        if (process.platform === 'win32') {
+            try {
+                prependToProcessPath(path.dirname(ffmpegPath));
+            } catch {
+                // ignore
+            }
+        }
+
+        // 1. saniyeden 1 kare al (çok kısa videolarda yine de çalışır)
+        const ffmpeg = spawn(ffmpegPath, [
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-ss', '00:00:01',
+            '-i', filePath,
+            '-frames:v', '1',
+            '-vf', 'scale=512:-1',
+            '-f', 'image2pipe',
+            '-vcodec', 'mjpeg',
+            'pipe:1'
+        ]);
+
+        const chunks = [];
+        ffmpeg.stdout.on('data', (chunk) => chunks.push(chunk));
+        ffmpeg.stderr.on('data', () => { /* ignore */ });
+
+        ffmpeg.on('close', (code) => {
+            if (code === 0 && chunks.length) {
+                const imageBuffer = Buffer.concat(chunks);
+                if (imageBuffer.length > 1000) {
+                    const base64 = imageBuffer.toString('base64');
+                    resolve(`data:image/jpeg;base64,${base64}`);
+                    return;
+                }
+            }
+            resolve(null);
+        });
+
+        ffmpeg.on('error', () => resolve(null));
     });
 }
 

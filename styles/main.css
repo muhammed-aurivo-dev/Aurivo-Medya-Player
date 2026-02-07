@@ -176,6 +176,19 @@ body.rtl .settings-tab {
     text-transform: uppercase;
 }
 
+.panel-actions {
+    padding: 10px 10px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.0));
+}
+
+.panel-actions-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
 /* File Tree */
 .file-tree {
     flex: 1;
@@ -202,26 +215,6 @@ body.rtl .settings-tab {
     color: var(--accent-primary);
 }
 
-/* Klasör Ekle Butonu */
-.tree-item.add-folder-btn {
-    background: linear-gradient(135deg, rgba(76, 175, 80, 0.15), rgba(76, 175, 80, 0.05));
-    border: 1px dashed rgba(76, 175, 80, 0.4);
-    border-radius: 6px;
-    margin: 8px;
-    color: #4CAF50;
-    transition: all 0.2s ease;
-}
-
-.tree-item.add-folder-btn:hover {
-    background: linear-gradient(135deg, rgba(76, 175, 80, 0.25), rgba(76, 175, 80, 0.1));
-    border-color: rgba(76, 175, 80, 0.7);
-    transform: translateX(2px);
-}
-
-.tree-item.add-folder-btn .tree-icon {
-    font-size: 16px;
-}
-
 /* Kullanıcı eklediği klasörler */
 .tree-item.user-folder {
     background: rgba(255, 193, 7, 0.08);
@@ -230,13 +223,6 @@ body.rtl .settings-tab {
 
 .tree-item.user-folder:hover {
     background: rgba(255, 193, 7, 0.15);
-}
-
-/* Ayırıcı çizgi */
-.tree-separator {
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--border-color), transparent);
-    margin: 8px 12px;
 }
 
 .tree-icon {
@@ -2741,6 +2727,31 @@ html[dir="rtl"] .restart-actions {
 .btn:hover {
     background-color: var(--accent-secondary);
     color: #000;
+}
+
+.btn.btn-small {
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+
+.page-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding: 10px 12px;
+}
+
+.page-toolbar-video {
+    position: absolute;
+    z-index: 5;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(6px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
 }
 
 /* ============================================

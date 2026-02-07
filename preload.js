@@ -583,6 +583,7 @@ const aurivoAPI = {
 
     // Medya Metadata
     getAlbumArt: (filePath) => ipcRenderer.invoke('media:getAlbumArt', filePath),
+    getVideoThumbnail: (filePath) => ipcRenderer.invoke('media:getVideoThumbnail', filePath),
 
     // Ayarlar
     saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),

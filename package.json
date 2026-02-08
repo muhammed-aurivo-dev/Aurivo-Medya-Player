@@ -169,19 +169,25 @@
           ]
         },
         {
-          "from": "native-dist",
-          "to": "native-dist",
-          "filter": [
-            "aurivo-projectm-visualizer.exe",
-            "*.dll"
-          ]
-        },
-        {
           "from": "native/build/Release",
           "to": "native/build/Release",
           "filter": [
             "**/*.node",
             "**/*.dll"
+          ]
+        },
+        {
+          "from": "libs/windows",
+          "to": "native/build/Release",
+          "filter": [
+            "*.dll"
+          ]
+        },
+        {
+          "from": "native-dist",
+          "to": "native-dist",
+          "filter": [
+            "*.dll"
           ]
         },
         {
@@ -202,13 +208,6 @@
           "filter": [
             "*.zip",
             "*.milk"
-          ]
-        },
-        {
-          "from": "libs/windows",
-          "to": "native/build/Release",
-          "filter": [
-            "*.dll"
           ]
         }
       ]

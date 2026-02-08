@@ -75,19 +75,27 @@ function ensureWindowsRuntimePaths() {
     if (process.platform !== 'win32') return;
 
     // PATH: make sure bundled native deps / ffmpeg are discoverable for child processes & DLL loader.
+    // BASS DLL'leri MUTLAKA native/build/Release içinde olmalı
     try {
         if (process.resourcesPath) {
-            prependToProcessPath(path.join(process.resourcesPath, 'bin'));
+            // BASS DLL'leri için en önemli yol
             prependToProcessPath(path.join(process.resourcesPath, 'native', 'build', 'Release'));
+            // Native addon'un dizini
             prependToProcessPath(path.join(process.resourcesPath, 'native-dist'));
+            // ffmpeg için
+            prependToProcessPath(path.join(process.resourcesPath, 'bin'));
+            // app.asar.unpacked fallback
+            prependToProcessPath(path.join(process.resourcesPath, 'app.asar.unpacked', 'native', 'build', 'Release'));
         }
 
-        // Dev fallbacks
-        prependToProcessPath(path.join(__dirname, 'third_party', 'ffmpeg'));
+        // Dev fallbacks (npm run dev için)
         prependToProcessPath(path.join(__dirname, 'native', 'build', 'Release'));
         prependToProcessPath(path.join(__dirname, 'native-dist'));
+        prependToProcessPath(path.join(__dirname, 'bin'));
+        prependToProcessPath(path.join(__dirname, 'libs', 'windows'));
+        prependToProcessPath(path.join(__dirname, 'third_party', 'ffmpeg'));
     } catch (e) {
-        console.warn('[WIN] PATH prep failed:', e?.message || e);
+        console.warn('[WIN] PATH hazırlama başarısız:', e?.message || e);
     }
 }
 

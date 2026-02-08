@@ -44,6 +44,29 @@ function prependToWindowsPath(dir) {
     process.env.PATH = `${dir};${cur}`;
 }
 
+function ensureBassPathsOnWindows() {
+    if (process.platform !== 'win32') return;
+    
+    // BASS DLL'lerinin yüklenmesi için PATH'i garantile
+    const bassDirs = [];
+    
+    if (process.resourcesPath) {
+        bassDirs.push(path.join(process.resourcesPath, 'native', 'build', 'Release'));
+        bassDirs.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'native', 'build', 'Release'));
+        bassDirs.push(path.join(process.resourcesPath, 'native-dist'));
+    }
+    
+    // Dev fallback
+    bassDirs.push(path.join(__dirname, 'native', 'build', 'Release'));
+    bassDirs.push(path.join(__dirname, 'native-dist'));
+    bassDirs.push(path.join(__dirname, 'bin'));
+    bassDirs.push(path.join(__dirname, 'libs', 'windows'));
+    
+    for (const dir of bassDirs) {
+        prependToWindowsPath(dir);
+    }
+}
+
 function tryLoadNativeAddon() {
     if (nativeAudio) return true;
     lastNativeLoadError = null;
@@ -51,36 +74,35 @@ function tryLoadNativeAddon() {
     const addonPaths = getAddonCandidatePaths();
     let lastErr = null;
 
+    // Windows'ta BASS DLL'leri PATH'te olmalı
+    if (process.platform === 'win32') {
+        ensureBassPathsOnWindows();
+    }
+
     for (const addonPath of addonPaths) {
         try {
             if (!fs.existsSync(addonPath)) continue;
+            
+            // Native addon'un dizinini PATH'e ekle
             prependToWindowsPath(path.dirname(addonPath));
+            
+            // Windows'ta yeniden BASS path'lerini garantile
             if (process.platform === 'win32') {
-                // Bonus: ensure common runtime dirs are also on PATH (BASS dlls etc.)
-                try {
-                    if (process.resourcesPath) {
-                        prependToWindowsPath(path.join(process.resourcesPath, 'native-dist'));
-                        prependToWindowsPath(path.join(process.resourcesPath, 'native', 'build', 'Release'));
-                        prependToWindowsPath(path.join(process.resourcesPath, 'bin'));
-                    }
-                    // Dev fallback
-                    prependToWindowsPath(path.join(__dirname, 'native', 'build', 'Release'));
-                    prependToWindowsPath(path.join(__dirname, 'native-dist'));
-                    prependToWindowsPath(path.join(__dirname, 'bin'));
-                } catch {
-                    // ignore
-                }
+                ensureBassPathsOnWindows();
             }
+            
             nativeAudio = require(addonPath);
             isNativeAvailable = true;
             loadedAddonPath = addonPath;
             console.log('✓ Aurivo C++ Audio Engine yüklendi:', addonPath);
+            console.log('[NativeAudio] PATH başı (BASS yüklemesi için):', String(process.env.PATH || '').split(';').slice(0, 5).join(';'));
             return true;
         } catch (error) {
             lastErr = error;
             if (process.platform === 'win32') {
                 console.warn(`[NativeAudio] Addon yükleme denemesi başarısız: ${addonPath}`);
                 console.warn(`  Hata: ${error.message || error}`);
+                console.warn(`  PATH başı: ${String(process.env.PATH || '').split(';').slice(0, 3).join(';')}`);
             }
         }
     }
@@ -92,9 +114,16 @@ function tryLoadNativeAddon() {
     if (process.platform === 'win32' && lastErr) {
         console.warn('[NativeAudio] Windows yükleme hatası:', lastErr.message || lastErr);
         console.warn('[NativeAudio] Çözüm adımları:');
-        console.warn('[NativeAudio]  1. Visual C++ Redistributable (VC++) yüklü mü?');
-        console.warn('[NativeAudio]  2. .node dosyası mevcut mu?:', addonPaths);
-        console.warn('[NativeAudio]  3. BASS DLL dosyaları native/build/Release/ içinde mi?');
+        console.warn('[NativeAudio]  1. Visual C++ Redistributable (x64) yüklü mü?');
+        console.warn('[NativeAudio]  2. aurivo_audio.node dosyası mevcut mu?: ', addonPaths[0]);
+        console.warn('[NativeAudio]  3. BASS DLL dosyaları bu yerde mi?');
+        const possibleBassDirs = [];
+        if (process.resourcesPath) {
+            possibleBassDirs.push(path.join(process.resourcesPath, 'native', 'build', 'Release'));
+            possibleBassDirs.push(path.join(process.resourcesPath, 'native-dist'));
+        }
+        possibleBassDirs.push(path.join(__dirname, 'native', 'build', 'Release'));
+        console.warn('[NativeAudio]     ' + possibleBassDirs.join('\n     '));
     }
     return false;
 }

@@ -35,6 +35,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify required Windows link libs exist
+        shell: pwsh
+        run: |
+          $missing = @()
+          if (!(Test-Path "libs\\windows\\bass.lib")) { $missing += "libs/windows/bass.lib" }
+          if (!(Test-Path "libs\\windows\\bass_fx.lib")) { $missing += "libs/windows/bass_fx.lib" }
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing required import libraries for MSVC linking:"
+            $missing | ForEach-Object { Write-Host "- $_" }
+            Write-Host ""
+            Write-Host "Çözüm: BASS SDK (Windows) içinden `bass.lib` ve `bass_fx.lib` dosyalarını `libs/windows/` içine koyup commit/push yapın."
+            exit 1
+          }
+
       - name: Build native audio addon (aurivo_audio.node)
         id: native_build
         continue-on-error: true

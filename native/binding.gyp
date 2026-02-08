@@ -36,7 +36,11 @@
                 }],
                 
                 ["OS=='win'", {
-                    "defines": ["WIN32", "_WINDOWS", "BASS_DYNAMIC_LOAD", "NOMINMAX", "WIN32_LEAN_AND_MEAN"],
+                    "defines": ["WIN32", "_WINDOWS", "NOMINMAX", "WIN32_LEAN_AND_MEAN"],
+                    "libraries": [
+                        "<(module_root_dir)/../libs/windows/bass.lib",
+                        "<(module_root_dir)/../libs/windows/bass_fx.lib"
+                    ],
                     "msvs_settings": {
                         "VCCLCompilerTool": {
                             "ExceptionHandling": 1,

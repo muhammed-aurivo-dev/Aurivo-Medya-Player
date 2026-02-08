@@ -52,8 +52,20 @@ jobs:
           npm --prefix native ci --ignore-scripts
           Assert-Ok "npm --prefix native ci"
 
-          npm --prefix native exec -- node-gyp rebuild --release --verbose
-          Assert-Ok "node-gyp rebuild"
+          $nodeGypLog = "native\\node-gyp-windows.log"
+          if (Test-Path $nodeGypLog) { Remove-Item $nodeGypLog -Force }
+
+          $proc = Start-Process -FilePath "npm" -NoNewWindow -Wait -PassThru `
+            -ArgumentList @("--prefix","native","exec","--","node-gyp","rebuild","--release","--verbose") `
+            -RedirectStandardOutput $nodeGypLog -RedirectStandardError $nodeGypLog
+
+          Write-Host "==== tail($nodeGypLog)"
+          if (Test-Path $nodeGypLog) { Get-Content $nodeGypLog -Tail 250 }
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "node-gyp rebuild failed with exit code $($proc.ExitCode)"
+            exit $proc.ExitCode
+          }
 
           npm --prefix native run copy-libs
           Assert-Ok "npm --prefix native run copy-libs"
@@ -84,6 +96,11 @@ jobs:
           if (Test-Path "native\build\config.gypi") {
             Write-Host "==== native/build/config.gypi (tail)"
             Get-Content "native\build\config.gypi" -Tail 120
+          }
+
+          if (Test-Path "native\node-gyp-windows.log") {
+            Write-Host "==== native/node-gyp-windows.log (tail)"
+            Get-Content "native\node-gyp-windows.log" -Tail 300
           }
 
       - name: Fail workflow if native build failed

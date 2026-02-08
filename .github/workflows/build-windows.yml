@@ -35,7 +35,40 @@ jobs:
         run: npm ci
 
       - name: Build native audio addon (aurivo_audio.node)
-        run: npm run rebuild-native
+        id: native_build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm --prefix native ci
+          npm --prefix native exec -- node-gyp rebuild --verbose
+          npm --prefix native run copy-libs
+
+      - name: Dump native build logs (on failure)
+        if: steps.native_build.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "native build failed; dumping npm logs..."
+          if (Test-Path "C:\npm\cache\_logs") {
+            Get-ChildItem "C:\npm\cache\_logs\*.log" |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 5 |
+              ForEach-Object {
+                Write-Host "==== $($_.FullName)"
+                Get-Content $_.FullName -Tail 250
+              }
+          } else {
+            Write-Host "C:\npm\cache\_logs not found"
+          }
+
+          if (Test-Path "native\build\config.gypi") {
+            Write-Host "==== native/build/config.gypi (tail)"
+            Get-Content "native\build\config.gypi" -Tail 120
+          }
+
+      - name: Fail workflow if native build failed
+        if: steps.native_build.outcome == 'failure'
+        run: exit 1
 
       - name: Setup MSYS2 (for Visualizer build)
         uses: msys2/setup-msys2@v2
@@ -74,4 +107,3 @@ jobs:
         with:
           name: Aurivo-Windows-${{ github.sha }}
           path: dist/*
-

@@ -38,6 +38,7 @@ jobs:
       - name: Build native audio addon (aurivo_audio.node)
         id: native_build
         continue-on-error: true
+        working-directory: native
         shell: pwsh
         run: |
           function Assert-Ok([string]$label) {
@@ -49,30 +50,40 @@ jobs:
 
           # In PowerShell, non-zero exit codes from external commands don't stop execution.
           # Make failures explicit so the workflow doesn't continue with missing artifacts.
-          npm --prefix native ci --ignore-scripts
-          Assert-Ok "npm --prefix native ci"
+          npm ci --ignore-scripts
+          Assert-Ok "npm ci"
 
-          $nodeGypLog = "native\\node-gyp-windows.log"
+          $stdoutLog = "node-gyp-stdout.log"
+          $stderrLog = "node-gyp-stderr.log"
+          $nodeGypLog = "node-gyp-windows.log"
+          if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
+          if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
           if (Test-Path $nodeGypLog) { Remove-Item $nodeGypLog -Force }
 
-          # Capture both stdout/stderr into one log file (Start-Process can't redirect both to the same file).
-          & npm --prefix native exec -- node-gyp rebuild --release --verbose 2>&1 | Tee-Object -FilePath $nodeGypLog
-          $nodeGypExit = $PIPELINESTATUS[0]
+          $proc = Start-Process -FilePath "npm" -NoNewWindow -Wait -PassThru `
+            -ArgumentList @("exec","--","node-gyp","rebuild","--release","--verbose") `
+            -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+
+          "# node-gyp stdout" | Set-Content $nodeGypLog
+          if (Test-Path $stdoutLog) { Get-Content $stdoutLog | Add-Content $nodeGypLog }
+          "" | Add-Content $nodeGypLog
+          "# node-gyp stderr" | Add-Content $nodeGypLog
+          if (Test-Path $stderrLog) { Get-Content $stderrLog | Add-Content $nodeGypLog }
 
           Write-Host "==== tail($nodeGypLog)"
           if (Test-Path $nodeGypLog) { Get-Content $nodeGypLog -Tail 800 }
 
-          if ($nodeGypExit -ne 0) {
-            Write-Host "node-gyp rebuild failed with exit code $nodeGypExit"
-            exit $nodeGypExit
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "node-gyp rebuild failed with exit code $($proc.ExitCode)"
+            exit $proc.ExitCode
           }
 
-          npm --prefix native run copy-libs
-          Assert-Ok "npm --prefix native run copy-libs"
+          npm run copy-libs
+          Assert-Ok "npm run copy-libs"
 
-          if (!(Test-Path "native\build\Release\aurivo_audio.node")) {
-            Write-Host "native\build\Release\aurivo_audio.node not found; dumping build folders..."
-            if (Test-Path "native\build") { Get-ChildItem "native\build" -Recurse -Depth 3 | Select-Object FullName,Length | Format-Table -AutoSize }
+          if (!(Test-Path "build\Release\aurivo_audio.node")) {
+            Write-Host "build\Release\aurivo_audio.node not found; dumping build folders..."
+            if (Test-Path "build") { Get-ChildItem "build" -Recurse -Depth 3 | Select-Object FullName,Length | Format-Table -AutoSize }
             exit 1
           }
 
@@ -103,6 +114,16 @@ jobs:
             Get-Content "native\node-gyp-windows.log" -Tail 1200
           }
 
+          if (Test-Path "native\node-gyp-stdout.log") {
+            Write-Host "==== native/node-gyp-stdout.log (tail)"
+            Get-Content "native\node-gyp-stdout.log" -Tail 400
+          }
+
+          if (Test-Path "native\node-gyp-stderr.log") {
+            Write-Host "==== native/node-gyp-stderr.log (tail)"
+            Get-Content "native\node-gyp-stderr.log" -Tail 400
+          }
+
       - name: Upload native build logs (on failure)
         if: steps.native_build.outcome == 'failure'
         uses: actions/upload-artifact@v4
@@ -110,6 +131,8 @@ jobs:
           name: windows-native-build-logs-${{ github.run_id }}
           path: |
             native/node-gyp-windows.log
+            native/node-gyp-stdout.log
+            native/node-gyp-stderr.log
             native/build/config.gypi
 
       - name: Fail workflow if native build failed

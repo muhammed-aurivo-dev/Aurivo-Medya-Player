@@ -9,12 +9,12 @@
                 "../libs/bass_fx/c"
             ],
             "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
-            "cflags!": ["-fno-exceptions"],
-            "cflags_cc!": ["-fno-exceptions"],
-            "cflags_cc": ["-std=c++17", "-fexceptions"],
             
             "conditions": [
                 ["OS=='linux'", {
+                    "cflags!": ["-fno-exceptions"],
+                    "cflags_cc!": ["-fno-exceptions"],
+                    "cflags_cc": ["-std=c++17", "-fexceptions"],
                     "libraries": [
                         "-L<(module_root_dir)/../libs/linux",
                         "-lbass",
@@ -39,12 +39,18 @@
                     "defines": ["WIN32", "_WINDOWS", "BASS_DYNAMIC_LOAD"],
                     "msvs_settings": {
                         "VCCLCompilerTool": {
-                            "ExceptionHandling": 1
+                            "ExceptionHandling": 1,
+                            "AdditionalOptions": [
+                                "/std:c++17"
+                            ]
                         }
                     }
                 }],
                 
                 ["OS=='mac'", {
+                    "cflags!": ["-fno-exceptions"],
+                    "cflags_cc!": ["-fno-exceptions"],
+                    "cflags_cc": ["-std=c++17", "-fexceptions"],
                     "libraries": [
                         "-L<(module_root_dir)/../libs/macos",
                         "-lbass",

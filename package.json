@@ -164,14 +164,8 @@
           "from": "bin",
           "to": "bin",
           "filter": [
-            "**/*"
-          ]
-        },
-        {
-          "from": "native-dist",
-          "to": "native-dist",
-          "filter": [
-            "**/*"
+            "ffmpeg.exe",
+            "ffprobe.exe"
           ]
         },
         {
@@ -195,19 +189,8 @@
           "to": "icons/aurivo_logo.bmp"
         },
         {
-          "from": "third_party/projectm/presets",
-          "to": "visualizer-presets"
-        },
-        {
           "from": "libs/windows",
           "to": "native/build/Release",
-          "filter": [
-            "*.dll"
-          ]
-        },
-        {
-          "from": "libs/windows",
-          "to": "native-dist",
           "filter": [
             "*.dll"
           ]

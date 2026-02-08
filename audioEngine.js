@@ -61,7 +61,12 @@ function tryLoadNativeAddon() {
                     if (process.resourcesPath) {
                         prependToWindowsPath(path.join(process.resourcesPath, 'native-dist'));
                         prependToWindowsPath(path.join(process.resourcesPath, 'native', 'build', 'Release'));
+                        prependToWindowsPath(path.join(process.resourcesPath, 'bin'));
                     }
+                    // Dev fallback
+                    prependToWindowsPath(path.join(__dirname, 'native', 'build', 'Release'));
+                    prependToWindowsPath(path.join(__dirname, 'native-dist'));
+                    prependToWindowsPath(path.join(__dirname, 'bin'));
                 } catch {
                     // ignore
                 }
@@ -73,6 +78,10 @@ function tryLoadNativeAddon() {
             return true;
         } catch (error) {
             lastErr = error;
+            if (process.platform === 'win32') {
+                console.warn(`[NativeAudio] Addon yükleme denemesi başarısız: ${addonPath}`);
+                console.warn(`  Hata: ${error.message || error}`);
+            }
         }
     }
 
@@ -82,6 +91,10 @@ function tryLoadNativeAddon() {
     console.warn('⚠ C++ Audio Engine yüklenemedi, HTML5 Audio kullanılacak');
     if (process.platform === 'win32' && lastErr) {
         console.warn('[NativeAudio] Windows yükleme hatası:', lastErr.message || lastErr);
+        console.warn('[NativeAudio] Çözüm adımları:');
+        console.warn('[NativeAudio]  1. Visual C++ Redistributable (VC++) yüklü mü?');
+        console.warn('[NativeAudio]  2. .node dosyası mevcut mu?:', addonPaths);
+        console.warn('[NativeAudio]  3. BASS DLL dosyaları native/build/Release/ içinde mi?');
     }
     return false;
 }

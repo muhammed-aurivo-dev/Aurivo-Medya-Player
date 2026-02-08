@@ -784,7 +784,14 @@ function createWindow() {
         // Native audio init'i UI yüklendikten sonra dene (başarısız olursa uygulama akışı bozulmasın)
         setTimeout(() => {
             try {
-                initNativeAudioEngineSafe();
+                const success = initNativeAudioEngineSafe();
+                if (!success && process.platform === 'win32') {
+                    logWindowsRuntimeDepsOnce('after-native-init-failed');
+                    console.error('[WINDOWS] Native audio başarısız oldu - Sistem gereksinimleri kontrol et:');
+                    console.error('[WINDOWS] 1. Visual C++ Runtime gerekli');
+                    console.error('[WINDOWS] 2. libs/windows/*.dll dosyaları derleme klasöründe olmalı');
+                    console.error('[WINDOWS] 3. native/build/Release/*.dll dosyaları derleme klasöründe olmalı');
+                }
             } catch (e) {
                 console.warn('[NativeAudio] init error:', e?.message || e);
             }
@@ -2509,50 +2516,110 @@ ipcMain.handle('audio:crossfadeTo', async (event, filePath, durationMs) => {
 
 // Oynat
 ipcMain.handle('audio:play', () => {
-    if (!audioEngine || !isNativeAudioAvailable) return;
-    audioEngine.play();
+    if (!audioEngine || !isNativeAudioAvailable) {
+        console.error('[AUDIO] play: Native audio yok');
+        return { success: false, error: 'Native audio engine yüklenmedi' };
+    }
+    try {
+        audioEngine.play();
+        return { success: true };
+    } catch (e) {
+        console.error('[AUDIO] play error:', e);
+        return { success: false, error: e.message };
+    }
 });
 
 // Duraklat
 ipcMain.handle('audio:pause', () => {
-    if (!audioEngine || !isNativeAudioAvailable) return;
-    audioEngine.pause();
+    if (!audioEngine || !isNativeAudioAvailable) {
+        console.error('[AUDIO] pause: Native audio yok');
+        return { success: false, error: 'Native audio engine yüklenmedi' };
+    }
+    try {
+        audioEngine.pause();
+        return { success: true };
+    } catch (e) {
+        console.error('[AUDIO] pause error:', e);
+        return { success: false, error: e.message };
+    }
 });
 
 // Durdur
 ipcMain.handle('audio:stop', () => {
-    if (!audioEngine || !isNativeAudioAvailable) return;
-    audioEngine.stop();
+    if (!audioEngine || !isNativeAudioAvailable) {
+        console.error('[AUDIO] stop: Native audio yok');
+        return { success: false, error: 'Native audio engine yüklenmedi' };
+    }
+    try {
+        audioEngine.stop();
+        return { success: true };
+    } catch (e) {
+        console.error('[AUDIO] stop error:', e);
+        return { success: false, error: e.message };
+    }
 });
 
 // Pozisyon atla
 ipcMain.handle('audio:seek', (event, positionMs) => {
-    if (!audioEngine || !isNativeAudioAvailable) return;
-    audioEngine.seek(positionMs);
+    if (!audioEngine || !isNativeAudioAvailable) {
+        console.error('[AUDIO] seek: Native audio yok');
+        return { success: false, error: 'Native audio engine yüklenmedi' };
+    }
+    try {
+        audioEngine.seek(positionMs);
+        return { success: true };
+    } catch (e) {
+        console.error('[AUDIO] seek error:', e);
+        return { success: false, error: e.message };
+    }
 });
 
 // Pozisyon al
 ipcMain.handle('audio:getPosition', () => {
     if (!audioEngine || !isNativeAudioAvailable) return 0;
-    return audioEngine.getPosition();
+    try {
+        return audioEngine.getPosition();
+    } catch (e) {
+        console.error('[AUDIO] getPosition error:', e);
+        return 0;
+    }
 });
 
 // Süre al
 ipcMain.handle('audio:getDuration', () => {
     if (!audioEngine || !isNativeAudioAvailable) return 0;
-    return audioEngine.getDuration();
+    try {
+        return audioEngine.getDuration();
+    } catch (e) {
+        console.error('[AUDIO] getDuration error:', e);
+        return 0;
+    }
 });
 
 // Çalıyor mu?
 ipcMain.handle('audio:isPlaying', () => {
     if (!audioEngine || !isNativeAudioAvailable) return false;
-    return audioEngine.isPlaying();
+    try {
+        return audioEngine.isPlaying();
+    } catch (e) {
+        console.error('[AUDIO] isPlaying error:', e);
+        return false;
+    }
 });
 
 // Ses seviyesi ayarla
 ipcMain.handle('audio:setVolume', (event, volume) => {
-    if (!audioEngine || !isNativeAudioAvailable) return;
-    audioEngine.setVolume(volume);
+    if (!audioEngine || !isNativeAudioAvailable) {
+        console.error('[AUDIO] setVolume: Native audio yok');
+        return { success: false, error: 'Native audio engine yüklenmedi' };
+    }
+    try {
+        audioEngine.setVolume(volume);
+        return { success: true };
+    } catch (e) {
+        console.error('[AUDIO] setVolume error:', e);
+        return { success: false, error: e.message };
+    }
 });
 
 // Volume fade (native engine): yoğun IPC spam yerine main'de ramp
@@ -2612,7 +2679,12 @@ ipcMain.handle('audio:fadeVolumeTo', async (event, targetVolume, durationMs) => 
 // Ses seviyesini al
 ipcMain.handle('audio:getVolume', () => {
     if (!audioEngine || !isNativeAudioAvailable) return 0;
-    return audioEngine.getVolume ? audioEngine.getVolume() : 1;
+    try {
+        return audioEngine.getVolume ? audioEngine.getVolume() : 1;
+    } catch (e) {
+        console.error('[AUDIO] getVolume error:', e);
+        return 0;
+    }
 });
 
 // EQ band ayarla
